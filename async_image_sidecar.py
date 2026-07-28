@@ -40,6 +40,10 @@ from urllib.parse import urlparse
 TERMINAL_STATUSES = {"completed", "partial_completed", "failed", "cancelled"}
 
 
+class QueueFullError(RuntimeError):
+    pass
+
+
 def now_ts() -> int:
     return int(time.time())
 
@@ -154,11 +158,26 @@ class Config:
     upload_url_prefix: str
     public_base_url: str
     worker_count: int
+    max_queue_size: int
     request_timeout_seconds: int
     callback_timeout_seconds: int
     max_body_bytes: int
     max_upload_bytes: int
+    task_retention_seconds: int
+    cleanup_interval_seconds: int
     allow_http_callback: bool
+
+
+def sanitize_persisted_response(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: sanitize_persisted_response(item)
+            for key, item in value.items()
+            if key != "b64_json"
+        }
+    if isinstance(value, list):
+        return [sanitize_persisted_response(item) for item in value]
+    return value
 
 
 class TaskStore:
@@ -213,6 +232,12 @@ class TaskStore:
                 """
                 CREATE INDEX IF NOT EXISTS image_tasks_status_created_idx
                 ON image_tasks(status, created_at)
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS image_tasks_status_completed_idx
+                ON image_tasks(status, completed_at)
                 """
             )
 
@@ -289,19 +314,26 @@ class TaskStore:
         response_payload: dict[str, Any],
         outputs: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        status = "completed" if outputs else "partial_completed"
         ts = now_ts()
+        persisted_response = sanitize_persisted_response(response_payload)
+        persisted_outputs = sanitize_persisted_response(outputs)
+        has_usable_output = any(
+            isinstance(output, dict) and bool(output.get("url"))
+            for output in persisted_outputs
+        )
+        status = "completed" if has_usable_output else "partial_completed"
         with self._lock, self.connect() as conn:
             conn.execute(
                 """
                 UPDATE image_tasks
-                SET status = ?, response_json = ?, outputs_json = ?, updated_at = ?, completed_at = ?
+                SET status = ?, request_json = '{}', api_key_ciphertext = NULL,
+                    response_json = ?, outputs_json = ?, updated_at = ?, completed_at = ?
                 WHERE id = ?
                 """,
                 (
                     status,
-                    json_dumps(response_payload),
-                    json_dumps(outputs),
+                    json_dumps(persisted_response),
+                    json_dumps(persisted_outputs),
                     ts,
                     ts,
                     task_id,
@@ -315,12 +347,110 @@ class TaskStore:
             conn.execute(
                 """
                 UPDATE image_tasks
-                SET status = 'failed', error = ?, updated_at = ?, completed_at = ?
+                SET status = 'failed', request_json = '{}', api_key_ciphertext = NULL,
+                    error = ?, updated_at = ?, completed_at = ?
                 WHERE id = ?
                 """,
                 (error, ts, ts, task_id),
             )
         return self.get_task(task_id) or {}
+
+    def delete_task(self, task_id: str) -> bool:
+        with self._lock, self.connect() as conn:
+            cursor = conn.execute("DELETE FROM image_tasks WHERE id = ?", (task_id,))
+        return cursor.rowcount > 0
+
+    def compact_terminal_tasks(self) -> int:
+        compacted = 0
+        with self._lock:
+            with self.connect() as conn:
+                task_ids = [
+                    str(row["id"])
+                    for row in conn.execute(
+                        """
+                        SELECT id
+                        FROM image_tasks
+                        WHERE status IN ('completed', 'partial_completed', 'failed', 'cancelled')
+                        """
+                    ).fetchall()
+                ]
+                for task_id in task_ids:
+                    row = conn.execute(
+                        """
+                        SELECT id, request_json, api_key_ciphertext, response_json, outputs_json
+                        FROM image_tasks
+                        WHERE id = ?
+                        """,
+                        (task_id,),
+                    ).fetchone()
+                    if row is None:
+                        continue
+                    response_json = row["response_json"]
+                    sanitized_json = response_json
+                    outputs_json = row["outputs_json"]
+                    sanitized_outputs_json = outputs_json
+                    if response_json:
+                        try:
+                            sanitized_json = json_dumps(sanitize_persisted_response(json.loads(response_json)))
+                        except (TypeError, ValueError):
+                            pass
+                    if outputs_json:
+                        try:
+                            sanitized_outputs_json = json_dumps(
+                                sanitize_persisted_response(json.loads(outputs_json))
+                            )
+                        except (TypeError, ValueError):
+                            pass
+                    if (
+                        row["request_json"] == "{}"
+                        and row["api_key_ciphertext"] is None
+                        and sanitized_json == response_json
+                        and sanitized_outputs_json == outputs_json
+                    ):
+                        continue
+                    conn.execute(
+                        """
+                        UPDATE image_tasks
+                        SET request_json = '{}', api_key_ciphertext = NULL,
+                            response_json = ?, outputs_json = ?
+                        WHERE id = ?
+                        """,
+                        (sanitized_json, sanitized_outputs_json, row["id"]),
+                    )
+                    compacted += 1
+            if compacted:
+                self._vacuum_locked()
+        return compacted
+
+    def delete_expired_terminal_tasks(self, cutoff: int) -> int:
+        with self._lock:
+            with self.connect() as conn:
+                cursor = conn.execute(
+                    """
+                    DELETE FROM image_tasks
+                    WHERE status IN ('completed', 'partial_completed', 'failed', 'cancelled')
+                      AND COALESCE(completed_at, updated_at) < ?
+                    """,
+                    (cutoff,),
+                )
+                deleted = cursor.rowcount
+            if deleted:
+                self._checkpoint_wal_locked()
+        return deleted
+
+    def reclaim_space(self) -> None:
+        with self._lock:
+            self._vacuum_locked()
+
+    def _checkpoint_wal_locked(self) -> None:
+        with self.connect() as conn:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+    def _vacuum_locked(self) -> None:
+        with self.connect() as conn:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            conn.execute("VACUUM")
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
     def set_callback_result(self, task_id: str, callback_status: str) -> None:
         with self._lock, self.connect() as conn:
@@ -512,7 +642,6 @@ def extract_outputs(response_payload: dict[str, Any], task_id: str, config: Conf
                     )
                     output.update(saved)
                 except Exception as exc:  # noqa: BLE001 - preserve result if local save fails.
-                    output["b64_json"] = item["b64_json"]
                     output["save_error"] = str(exc)
             if isinstance(item.get("revised_prompt"), str):
                 output["revised_prompt"] = item["revised_prompt"]
@@ -521,43 +650,124 @@ def extract_outputs(response_payload: dict[str, Any], task_id: str, config: Conf
     return outputs
 
 
+def delete_expired_files(directory: str, cutoff: int) -> int:
+    if not os.path.isdir(directory):
+        return 0
+    deleted = 0
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            try:
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                if entry.stat(follow_symlinks=False).st_mtime >= cutoff:
+                    continue
+                os.unlink(entry.path)
+                deleted += 1
+            except FileNotFoundError:
+                continue
+    return deleted
+
+
 class WorkerPool:
     def __init__(self, config: Config, store: TaskStore) -> None:
         self.config = config
         self.store = store
-        self.tasks: queue.Queue[str] = queue.Queue()
+        self.tasks: queue.Queue[str] = queue.Queue(maxsize=config.max_queue_size)
         self.shutdown_event = threading.Event()
         self.threads: list[threading.Thread] = []
+        self.recovery_thread: threading.Thread | None = None
+        self.cleanup_thread: threading.Thread | None = None
 
     def start(self) -> None:
-        for task_id in self.store.requeue_unfinished():
-            self.enqueue(task_id)
+        cleanup_stats = self.cleanup_expired()
+        compacted = self.store.compact_terminal_tasks()
+        if cleanup_stats["tasks"] and not compacted:
+            self.store.reclaim_space()
+        if compacted or any(cleanup_stats.values()):
+            print(f"startup maintenance compacted_tasks={compacted} cleanup={cleanup_stats}", flush=True)
         for idx in range(self.config.worker_count):
             thread = threading.Thread(target=self._run, name=f"async-image-worker-{idx + 1}", daemon=True)
             thread.start()
             self.threads.append(thread)
+        unfinished = self.store.requeue_unfinished()
+        if unfinished:
+            self.recovery_thread = threading.Thread(
+                target=self._recover_tasks,
+                args=(unfinished,),
+                name="async-image-recovery",
+                daemon=True,
+            )
+            self.recovery_thread.start()
+        self.cleanup_thread = threading.Thread(
+            target=self._cleanup_loop,
+            name="async-image-cleanup",
+            daemon=True,
+        )
+        self.cleanup_thread.start()
 
     def stop(self) -> None:
         self.shutdown_event.set()
         for _ in self.threads:
-            self.tasks.put("")
+            try:
+                self.tasks.put("", timeout=1)
+            except queue.Full:
+                break
         for thread in self.threads:
             thread.join(timeout=5)
+        if self.recovery_thread:
+            self.recovery_thread.join(timeout=5)
+        if self.cleanup_thread:
+            self.cleanup_thread.join(timeout=5)
 
-    def enqueue(self, task_id: str) -> None:
-        self.tasks.put(task_id)
+    def enqueue(self, task_id: str) -> bool:
+        try:
+            self.tasks.put_nowait(task_id)
+            return True
+        except queue.Full:
+            return False
+
+    def _recover_tasks(self, task_ids: list[str]) -> None:
+        for task_id in task_ids:
+            while not self.shutdown_event.is_set():
+                try:
+                    self.tasks.put(task_id, timeout=1)
+                    break
+                except queue.Full:
+                    continue
+
+    def _cleanup_loop(self) -> None:
+        while not self.shutdown_event.wait(self.config.cleanup_interval_seconds):
+            try:
+                stats = self.cleanup_expired()
+                if any(stats.values()):
+                    print(f"expired data cleanup={stats}", flush=True)
+            except Exception as exc:  # noqa: BLE001 - maintenance failure must not stop workers.
+                print(f"cleanup error: {exc}", file=sys.stderr)
+                traceback.print_exc()
+
+    def cleanup_expired(self) -> dict[str, int]:
+        if self.config.task_retention_seconds <= 0:
+            return {"tasks": 0, "images": 0, "uploads": 0}
+        cutoff = now_ts() - self.config.task_retention_seconds
+        return {
+            "tasks": self.store.delete_expired_terminal_tasks(cutoff),
+            "images": delete_expired_files(self.config.image_dir, cutoff),
+            "uploads": delete_expired_files(self.config.upload_dir, cutoff),
+        }
 
     def _run(self) -> None:
-        while not self.shutdown_event.is_set():
+        while True:
             task_id = self.tasks.get()
-            if not task_id:
-                continue
             try:
+                if not task_id or self.shutdown_event.is_set():
+                    return
                 self._process(task_id)
             except Exception as exc:  # noqa: BLE001 - keep worker alive for MVP reliability.
                 print(f"worker error task_id={task_id}: {exc}", file=sys.stderr)
                 traceback.print_exc()
                 self.store.fail_task(task_id, str(exc))
+            finally:
+                self.tasks.task_done()
 
     def _process(self, task_id: str) -> None:
         task = self.store.get_task(task_id)
@@ -683,6 +893,9 @@ class AsyncImageHandler(BaseHTTPRequestHandler):
             try:
                 body = read_json_body(self, self.server.config.max_body_bytes)  # type: ignore[attr-defined]
                 task = self._submit_image_request("/v1/images/generations", body, api_key, None)
+            except QueueFullError as exc:
+                error_response(self, 503, "server_overloaded", str(exc))
+                return
             except ValueError as exc:
                 error_response(self, 400, "invalid_request", str(exc))
                 return
@@ -694,6 +907,9 @@ class AsyncImageHandler(BaseHTTPRequestHandler):
                 return
             try:
                 task = self._submit_multipart_edit(api_key)
+            except QueueFullError as exc:
+                error_response(self, 503, "server_overloaded", str(exc))
+                return
             except ValueError as exc:
                 error_response(self, 400, "invalid_request", str(exc))
                 return
@@ -719,6 +935,9 @@ class AsyncImageHandler(BaseHTTPRequestHandler):
         try:
             body = read_json_body(self, self.server.config.max_body_bytes)  # type: ignore[attr-defined]
             task = self._submit_task(body, api_key)
+        except QueueFullError as exc:
+            error_response(self, 503, "server_overloaded", str(exc))
+            return
         except ValueError as exc:
             error_response(self, 400, "invalid_request", str(exc))
             return
@@ -855,7 +1074,9 @@ class AsyncImageHandler(BaseHTTPRequestHandler):
             api_key=api_key,
             callback_url=callback_url,
         )
-        self.server.worker_pool.enqueue(task_id)  # type: ignore[attr-defined]
+        if not self.server.worker_pool.enqueue(task_id):  # type: ignore[attr-defined]
+            self.server.store.delete_task(task_id)  # type: ignore[attr-defined]
+            raise QueueFullError("task queue is full; retry later")
         return task
 
     def _submit_image_request(
@@ -997,10 +1218,21 @@ def load_config() -> Config:
     parser.add_argument("--upload-url-prefix", default=os.getenv("ASYNC_IMAGE_UPLOAD_URL_PREFIX", "/v1/task/uploads"))
     parser.add_argument("--public-base-url", default=os.getenv("ASYNC_IMAGE_PUBLIC_BASE_URL", ""))
     parser.add_argument("--workers", type=int, default=int(os.getenv("ASYNC_IMAGE_WORKERS", "2")))
+    parser.add_argument("--max-queue-size", type=int, default=int(os.getenv("ASYNC_IMAGE_MAX_QUEUE_SIZE", "100")))
     parser.add_argument("--request-timeout", type=int, default=int(os.getenv("ASYNC_IMAGE_REQUEST_TIMEOUT_SECONDS", "900")))
     parser.add_argument("--callback-timeout", type=int, default=int(os.getenv("ASYNC_IMAGE_CALLBACK_TIMEOUT_SECONDS", "15")))
     parser.add_argument("--max-body-bytes", type=int, default=int(os.getenv("ASYNC_IMAGE_MAX_BODY_BYTES", "1048576")))
     parser.add_argument("--max-upload-bytes", type=int, default=int(os.getenv("ASYNC_IMAGE_MAX_UPLOAD_BYTES", str(20 << 20))))
+    parser.add_argument(
+        "--task-retention-seconds",
+        type=int,
+        default=int(os.getenv("ASYNC_IMAGE_TASK_RETENTION_SECONDS", "86400")),
+    )
+    parser.add_argument(
+        "--cleanup-interval-seconds",
+        type=int,
+        default=int(os.getenv("ASYNC_IMAGE_CLEANUP_INTERVAL_SECONDS", "600")),
+    )
     parser.add_argument(
         "--allow-http-callback",
         action="store_true",
@@ -1012,6 +1244,12 @@ def load_config() -> Config:
         raise SystemExit("ASYNC_IMAGE_TOKEN_SECRET or --token-secret is required")
     if args.workers < 1:
         raise SystemExit("workers must be >= 1")
+    if args.max_queue_size < 1:
+        raise SystemExit("max queue size must be >= 1")
+    if args.task_retention_seconds < 0:
+        raise SystemExit("task retention seconds must be >= 0")
+    if args.cleanup_interval_seconds < 1:
+        raise SystemExit("cleanup interval seconds must be >= 1")
 
     return Config(
         bind_host=args.host,
@@ -1026,10 +1264,13 @@ def load_config() -> Config:
         upload_url_prefix=args.upload_url_prefix,
         public_base_url=args.public_base_url,
         worker_count=args.workers,
+        max_queue_size=args.max_queue_size,
         request_timeout_seconds=args.request_timeout,
         callback_timeout_seconds=args.callback_timeout,
         max_body_bytes=args.max_body_bytes,
         max_upload_bytes=args.max_upload_bytes,
+        task_retention_seconds=args.task_retention_seconds,
+        cleanup_interval_seconds=args.cleanup_interval_seconds,
         allow_http_callback=args.allow_http_callback,
     )
 

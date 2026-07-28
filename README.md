@@ -2,9 +2,9 @@
 
 Sub2API 图片请求的异步任务 Sidecar。它接收图片生成或编辑请求，在后台调用 Sub2API 的 OpenAI 兼容图片接口，并通过任务查询接口返回状态和结果。
 
-## 当前基线
+## 来源
 
-`async_image_sidecar.py` 是从现有 VPS 部署提取的原始基线，尚未进行逻辑修改。导入时的 SHA-256：
+初始版本从现有 VPS 部署提取。未修改基线的 SHA-256：
 
 ```text
 c933fd429b4db3ff1e51888c3fdb5ede2eea27ae81e766f81cc0acf06ec3152d
@@ -45,12 +45,37 @@ docker compose ps
 
 Sidecar 默认只监听宿主机 `127.0.0.1:8090`，并连接已经存在的 Sub2API Docker 网络。若网络名称不同，修改 `.env` 中的 `SUB2API_DOCKER_NETWORK`。
 
-## 已知问题
+## 数据生命周期和过载保护
 
-当前基线不具备数据保留期限和自动清理机制：
+默认配置：
 
-- 上游响应 JSON 可能包含 Base64 图片并被完整写入 SQLite。
-- 输出图片和上传图片会持续保存在 `/data`。
-- 任务队列没有容量上限。
+- 终态任务、输出图片和上传图片保留 `86400` 秒（24 小时）。
+- 清理线程每 `600` 秒执行一次。
+- 等待队列最多容纳 `100` 个任务；队列满时返回 HTTP `503 server_overloaded`。
+- 任务完成或失败后，立即清除原始请求和 API Key 密文。
+- SQLite 中的响应和输出不会持久化 `b64_json`；Base64 图片成功落盘后只返回文件 URL。
+- 启动时会压缩旧版本留下的终态记录，并回收其 SQLite 空间。
 
-请求量持续增长时，磁盘和内存都可能被耗尽。后续改造应优先增加 TTL 清理、去除数据库中的 Base64 响应、限制队列长度，并补充资源和并发测试。
+通过以下环境变量调整：
+
+```text
+ASYNC_IMAGE_TASK_RETENTION_SECONDS=86400
+ASYNC_IMAGE_CLEANUP_INTERVAL_SECONDS=600
+ASYNC_IMAGE_MAX_QUEUE_SIZE=100
+```
+
+将 `ASYNC_IMAGE_TASK_RETENTION_SECONDS` 设为 `0` 可以禁用自动过期。文件 URL 在对应文件过期后会返回 404。
+
+## 测试
+
+```bash
+PYTHONPATH=. python -m unittest discover -s tests -v
+```
+
+测试覆盖终态数据压缩、TTL 清理、队列满载 503、积压任务恢复，以及从提交任务到读取生成图片的完整 HTTP 流程。
+
+## 剩余边界
+
+上游响应仍会先完整读入内存再解析，multipart 上传也会在 `ASYNC_IMAGE_MAX_UPLOAD_BYTES` 限制内完整读入内存。因此本次改造消除了长期持久化和无界队列导致的持续增长，但不能消除单个大请求的瞬时内存峰值。
+
+代码仍使用 Python 3.12 的 `cgi` 模块处理 multipart；该模块在 Python 3.13 已移除，升级基础镜像前需要替换 multipart 解析实现。
