@@ -1,0 +1,45 @@
+services:
+  async-image-sidecar:
+    build:
+      context: .
+    image: ${ASYNC_IMAGE_IMAGE:-sub2api-async-image-sidecar:local}
+    container_name: sub2api-async-image-sidecar
+    restart: unless-stopped
+    init: true
+    ports:
+      - "${ASYNC_IMAGE_BIND_HOST:-127.0.0.1}:${ASYNC_IMAGE_PORT:-8090}:8090"
+    environment:
+      ASYNC_IMAGE_PORT: "8090"
+      ASYNC_IMAGE_DB: /data/async-image-tasks.sqlite3
+      ASYNC_IMAGE_TOKEN_SECRET: ${ASYNC_IMAGE_TOKEN_SECRET:?ASYNC_IMAGE_TOKEN_SECRET is required}
+      ASYNC_IMAGE_CALLBACK_SECRET: ${ASYNC_IMAGE_CALLBACK_SECRET:-}
+      ASYNC_IMAGE_WORKERS: ${ASYNC_IMAGE_WORKERS:-2}
+      ASYNC_IMAGE_REQUEST_TIMEOUT_SECONDS: ${ASYNC_IMAGE_REQUEST_TIMEOUT_SECONDS:-900}
+      ASYNC_IMAGE_CALLBACK_TIMEOUT_SECONDS: ${ASYNC_IMAGE_CALLBACK_TIMEOUT_SECONDS:-15}
+      ASYNC_IMAGE_MAX_BODY_BYTES: ${ASYNC_IMAGE_MAX_BODY_BYTES:-1048576}
+      ASYNC_IMAGE_MAX_UPLOAD_BYTES: ${ASYNC_IMAGE_MAX_UPLOAD_BYTES:-20971520}
+      ASYNC_IMAGE_ALLOW_HTTP_CALLBACK: ${ASYNC_IMAGE_ALLOW_HTTP_CALLBACK:-false}
+      ASYNC_IMAGE_PUBLIC_BASE_URL: ${ASYNC_IMAGE_PUBLIC_BASE_URL:-}
+      SUB2API_BASE_URL: ${SUB2API_BASE_URL:-http://sub2api:8080}
+    volumes:
+      - async_image_sidecar_data:/data
+    networks:
+      - sub2api
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=5).read()
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  async_image_sidecar_data:
+
+networks:
+  sub2api:
+    external: true
+    name: ${SUB2API_DOCKER_NETWORK:-sub2api_sub2api-net}
