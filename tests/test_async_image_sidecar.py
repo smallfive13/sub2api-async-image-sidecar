@@ -1,7 +1,10 @@
 import base64
 import json
 import os
+import socket
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -422,6 +425,54 @@ class EndToEndTest(unittest.TestCase):
                 sidecar.server_close()
                 sidecar_thread.join(timeout=5)
                 pool.stop()
+
+
+class GracefulShutdownTest(unittest.TestCase):
+    def test_sigterm_exits_without_docker_force_kill(self) -> None:
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        with tempfile.TemporaryDirectory() as root:
+            env = os.environ.copy()
+            env["ASYNC_IMAGE_TOKEN_SECRET"] = "test-token-secret"
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve().parents[1] / "async_image_sidecar.py"),
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    str(port),
+                    "--db",
+                    os.path.join(root, "tasks.sqlite3"),
+                    "--image-dir",
+                    os.path.join(root, "images"),
+                    "--upload-dir",
+                    os.path.join(root, "uploads"),
+                ],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            try:
+                deadline = time.time() + 5
+                while True:
+                    try:
+                        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=1) as response:
+                            self.assertEqual(response.status, 200)
+                        break
+                    except (urllib.error.URLError, ConnectionError):
+                        if time.time() >= deadline:
+                            self.fail("sidecar did not become healthy before timeout")
+                        time.sleep(0.05)
+                process.terminate()
+                output, _ = process.communicate(timeout=3)
+                self.assertEqual(process.returncode, 0, output)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate(timeout=3)
 
 
 if __name__ == "__main__":

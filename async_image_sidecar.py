@@ -1281,9 +1281,17 @@ def main() -> None:
     worker_pool = WorkerPool(config, store)
     worker_pool.start()
     server = AsyncImageServer((config.bind_host, config.port), config, store, worker_pool)
+    shutdown_started = threading.Event()
 
     def handle_signal(_signum: int, _frame: Any) -> None:
-        server.shutdown()
+        if shutdown_started.is_set():
+            return
+        shutdown_started.set()
+        threading.Thread(
+            target=server.shutdown,
+            name="async-image-shutdown",
+            daemon=True,
+        ).start()
 
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
