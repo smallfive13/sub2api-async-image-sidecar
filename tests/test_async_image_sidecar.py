@@ -44,12 +44,14 @@ def make_config(
         upload_dir=os.path.join(root, "uploads"),
         upload_url_prefix="/v1/task/uploads",
         public_base_url="",
+        default_generation_model="gpt-image-2.5-flare",
+        default_edit_model="gpt-image-2.5-sunburst",
         worker_count=1,
         max_queue_size=max_queue_size,
         request_timeout_seconds=5,
         callback_timeout_seconds=5,
         max_body_bytes=1024 * 1024,
-        max_upload_bytes=20 * 1024 * 1024,
+        max_upload_bytes=50 * 1024 * 1024,
         task_retention_seconds=task_retention_seconds,
         cleanup_interval_seconds=600,
         allow_http_callback=False,
@@ -110,6 +112,31 @@ class TaskStoreTest(unittest.TestCase):
         self.assertNotIn(encoded, row["outputs_json"])
         self.assertEqual(task["response"]["data"][0]["revised_prompt"], "revised")
         self.assertEqual(task["response"]["usage"]["total_tokens"], 1)
+
+    def test_complete_responses_task_removes_image_result_from_storage(self) -> None:
+        encoded = base64.b64encode(b"responses-image").decode("ascii")
+        self.create_task("task_responses")
+
+        task = self.store.complete_task(
+            "task_responses",
+            {
+                "id": "resp_123",
+                "output": [
+                    {
+                        "id": "ig_123",
+                        "type": "image_generation_call",
+                        "result": encoded,
+                        "output_format": "png",
+                    }
+                ],
+            },
+            [{"url": "/v1/task/images/task_responses_0.png"}],
+        )
+
+        row = self.raw_row("task_responses")
+        self.assertNotIn(encoded, row["response_json"])
+        self.assertNotIn("result", row["response_json"])
+        self.assertEqual(task["response"]["output"][0]["id"], "ig_123")
 
     def test_fail_task_removes_request_and_api_key_from_storage(self) -> None:
         self.create_task("task_failed", {"model": "gpt-image-2", "prompt": "sensitive prompt"})
@@ -214,6 +241,33 @@ class FileCleanupTest(unittest.TestCase):
             self.assertEqual(len(outputs), 1)
             self.assertIn("save_error", outputs[0])
             self.assertNotIn("b64_json", outputs[0])
+            self.assertNotIn(encoded, json.dumps(outputs))
+
+    def test_extract_outputs_saves_responses_image_generation_calls(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            config = make_config(root)
+            image_bytes = b"\x89PNG\r\n\x1a\nresponses-image"
+            encoded = base64.b64encode(image_bytes).decode("ascii")
+
+            outputs = extract_outputs(
+                {
+                    "output": [
+                        {
+                            "id": "ig_123",
+                            "type": "image_generation_call",
+                            "result": encoded,
+                            "output_format": "png",
+                            "revised_prompt": "keep the subject",
+                        }
+                    ]
+                },
+                "task_responses",
+                config,
+            )
+
+            self.assertEqual(outputs[0]["generation_id"], "ig_123")
+            self.assertEqual(outputs[0]["revised_prompt"], "keep the subject")
+            self.assertEqual(Path(config.image_dir, outputs[0]["file"]).read_bytes(), image_bytes)
             self.assertNotIn(encoded, json.dumps(outputs))
 
     def test_delete_expired_files_uses_mtime_and_ignores_directories(self) -> None:
@@ -341,14 +395,72 @@ class CleanupIntegrationTest(unittest.TestCase):
 
 
 class EndToEndTest(unittest.TestCase):
+    def test_multipart_edit_accepts_multiple_image_array_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            config = make_config(root)
+            store = TaskStore(config.db_path, config.token_secret)
+            pool = WorkerPool(config, store)
+            sidecar = AsyncImageServer(("127.0.0.1", 0), config, store, pool)
+            sidecar_thread = threading.Thread(target=sidecar.serve_forever, daemon=True)
+            sidecar_thread.start()
+            boundary = "sidecar-test-boundary"
+            parts = [
+                f"--{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\npreserve subject\r\n".encode(),
+                f"--{boundary}\r\nContent-Disposition: form-data; name=\"quality\"\r\n\r\nxhigh\r\n".encode(),
+            ]
+            for index, content in enumerate((b"first-image", b"second-image")):
+                parts.append(
+                    (
+                        f"--{boundary}\r\n"
+                        f"Content-Disposition: form-data; name=\"image[]\"; filename=\"source-{index}.png\"\r\n"
+                        "Content-Type: image/png\r\n\r\n"
+                    ).encode()
+                    + content
+                    + b"\r\n"
+                )
+            parts.append(f"--{boundary}--\r\n".encode())
+            body = b"".join(parts)
+            try:
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{sidecar.server_address[1]}/v1/images/edits",
+                    data=body,
+                    method="POST",
+                    headers={
+                        "Authorization": "Bearer sub2api-test-key",
+                        "Content-Type": f"multipart/form-data; boundary={boundary}",
+                    },
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    self.assertEqual(response.status, 202)
+                    submitted = json.loads(response.read().decode("utf-8"))
+
+                self.assertEqual(submitted["model"], "gpt-image-2.5-sunburst")
+                with store.connect() as conn:
+                    row = conn.execute(
+                        "SELECT request_json FROM image_tasks WHERE id = ?",
+                        (submitted["id"],),
+                    ).fetchone()
+                payload = json.loads(row["request_json"])
+                self.assertEqual(payload["model"], "gpt-image-2.5-sunburst")
+                self.assertEqual(payload["quality"], "xhigh")
+                self.assertEqual(len(payload["images"]), 2)
+                self.assertTrue(all(image["image_url"].startswith("data:image/png;base64,") for image in payload["images"]))
+            finally:
+                sidecar.shutdown()
+                sidecar.server_close()
+                sidecar_thread.join(timeout=5)
+
     def test_submit_process_poll_and_fetch_image(self) -> None:
         image_bytes = b"\x89PNG\r\n\x1a\nimage-payload"
         encoded = base64.b64encode(image_bytes).decode("ascii")
 
         class FakeUpstreamHandler(BaseHTTPRequestHandler):
+            requests: list[dict] = []
+
             def do_POST(self) -> None:  # noqa: N802
                 content_length = int(self.headers.get("Content-Length", "0"))
-                self.rfile.read(content_length)
+                body = json.loads(self.rfile.read(content_length))
+                self.__class__.requests.append(body)
                 response = json.dumps(
                     {"data": [{"b64_json": encoded, "revised_prompt": "revised"}], "usage": {"total_tokens": 3}}
                 ).encode("utf-8")
@@ -386,7 +498,7 @@ class EndToEndTest(unittest.TestCase):
             try:
                 submit_request = urllib.request.Request(
                     base_url + "/v1/images/generations",
-                    data=json.dumps({"model": "gpt-image-2", "prompt": "test"}).encode("utf-8"),
+                    data=json.dumps({"prompt": "test", "quality": "max", "size": "1536x864"}).encode("utf-8"),
                     method="POST",
                     headers=headers,
                 )
@@ -407,7 +519,11 @@ class EndToEndTest(unittest.TestCase):
                         task = json.loads(response.read().decode("utf-8"))
 
                 self.assertEqual(task["status"], "completed")
+                self.assertEqual(task["model"], "gpt-image-2.5-flare")
                 self.assertEqual(task["response"]["usage"]["total_tokens"], 3)
+                self.assertEqual(FakeUpstreamHandler.requests[0]["model"], "gpt-image-2.5-flare")
+                self.assertEqual(FakeUpstreamHandler.requests[0]["quality"], "max")
+                self.assertEqual(FakeUpstreamHandler.requests[0]["size"], "1536x864")
                 self.assertNotIn("b64_json", json.dumps(task))
                 with urllib.request.urlopen(base_url + task["outputs"][0]["url"], timeout=5) as response:
                     self.assertEqual(response.read(), image_bytes)
@@ -420,6 +536,108 @@ class EndToEndTest(unittest.TestCase):
                 self.assertIsNone(row["api_key_ciphertext"])
                 self.assertNotIn(encoded, row["response_json"])
                 self.assertNotIn(encoded, row["outputs_json"])
+            finally:
+                sidecar.shutdown()
+                sidecar.server_close()
+                sidecar_thread.join(timeout=5)
+                pool.stop()
+
+    def test_responses_thinking_edit_processes_image_output(self) -> None:
+        image_bytes = b"\x89PNG\r\n\x1a\nthinking-edit"
+        encoded = base64.b64encode(image_bytes).decode("ascii")
+
+        class FakeUpstreamHandler(BaseHTTPRequestHandler):
+            path_seen = ""
+            body_seen: dict = {}
+
+            def do_POST(self) -> None:  # noqa: N802
+                content_length = int(self.headers.get("Content-Length", "0"))
+                self.__class__.path_seen = self.path
+                self.__class__.body_seen = json.loads(self.rfile.read(content_length))
+                response = json.dumps(
+                    {
+                        "id": "resp_123",
+                        "output": [
+                            {
+                                "id": "ig_123",
+                                "type": "image_generation_call",
+                                "result": encoded,
+                                "output_format": "png",
+                            }
+                        ],
+                        "usage": {"input_tokens": 11, "output_tokens": 22},
+                    }
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(response)))
+                self.end_headers()
+                self.wfile.write(response)
+
+            def log_message(self, _fmt: str, *_args: object) -> None:
+                pass
+
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), FakeUpstreamHandler)
+        upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        upstream_thread.start()
+        self.addCleanup(upstream_thread.join, 5)
+        self.addCleanup(upstream.server_close)
+        self.addCleanup(upstream.shutdown)
+        with tempfile.TemporaryDirectory() as root:
+            config = make_config(
+                root,
+                sub2api_base_url=f"http://127.0.0.1:{upstream.server_address[1]}",
+            )
+            store = TaskStore(config.db_path, config.token_secret)
+            pool = WorkerPool(config, store)
+            sidecar = AsyncImageServer(("127.0.0.1", 0), config, store, pool)
+            sidecar_thread = threading.Thread(target=sidecar.serve_forever, daemon=True)
+            pool.start()
+            sidecar_thread.start()
+            base_url = f"http://127.0.0.1:{sidecar.server_address[1]}"
+            payload = {
+                "model": "gpt-6-astra",
+                "reasoning": {"effort": "high"},
+                "input": "Preserve the subject and change the background",
+                "tools": [
+                    {
+                        "type": "image_generation",
+                        "model": "gpt-image-2.5-sunburst",
+                        "action": "edit",
+                        "quality": "xhigh",
+                    }
+                ],
+            }
+            try:
+                submit_request = urllib.request.Request(
+                    base_url + "/v1/images/responses",
+                    data=json.dumps(payload).encode("utf-8"),
+                    method="POST",
+                    headers={"Authorization": "Bearer sub2api-test-key", "Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(submit_request, timeout=5) as response:
+                    self.assertEqual(response.status, 202)
+                    submitted = json.loads(response.read().decode("utf-8"))
+
+                task = submitted
+                deadline = time.time() + 5
+                while task["status"] not in {"completed", "partial_completed", "failed"}:
+                    self.assertLess(time.time(), deadline, "task did not complete before timeout")
+                    time.sleep(0.05)
+                    poll_request = urllib.request.Request(
+                        base_url + "/v1/task/" + submitted["id"],
+                        headers={"Authorization": "Bearer sub2api-test-key"},
+                    )
+                    with urllib.request.urlopen(poll_request, timeout=5) as response:
+                        task = json.loads(response.read().decode("utf-8"))
+
+                self.assertEqual(task["status"], "completed")
+                self.assertEqual(task["model"], "gpt-6-astra")
+                self.assertEqual(FakeUpstreamHandler.path_seen, "/v1/responses")
+                self.assertEqual(FakeUpstreamHandler.body_seen, payload)
+                self.assertNotIn(encoded, json.dumps(task))
+                with urllib.request.urlopen(base_url + task["outputs"][0]["url"], timeout=5) as response:
+                    self.assertEqual(response.read(), image_bytes)
             finally:
                 sidecar.shutdown()
                 sidecar.server_close()

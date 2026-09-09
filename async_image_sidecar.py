@@ -3,6 +3,9 @@
 Minimal async image task sidecar for Sub2API.
 
 It exposes:
+  POST /v1/images/generations
+  POST /v1/images/edits
+  POST /v1/images/responses
   POST /v1/task/submit
   GET  /v1/task/{task_id}
   GET  /health
@@ -38,6 +41,8 @@ from urllib.parse import urlparse
 
 
 TERMINAL_STATUSES = {"completed", "partial_completed", "failed", "cancelled"}
+DEFAULT_GENERATION_MODEL = "gpt-image-2.5-flare"
+DEFAULT_EDIT_MODEL = "gpt-image-2.5-sunburst"
 
 
 class QueueFullError(RuntimeError):
@@ -157,6 +162,8 @@ class Config:
     upload_dir: str
     upload_url_prefix: str
     public_base_url: str
+    default_generation_model: str
+    default_edit_model: str
     worker_count: int
     max_queue_size: int
     request_timeout_seconds: int
@@ -170,10 +177,11 @@ class Config:
 
 def sanitize_persisted_response(value: Any) -> Any:
     if isinstance(value, dict):
+        image_call = value.get("type") == "image_generation_call"
         return {
             key: sanitize_persisted_response(item)
             for key, item in value.items()
-            if key != "b64_json"
+            if key != "b64_json" and not (image_call and key == "result")
         }
     if isinstance(value, list):
         return [sanitize_persisted_response(item) for item in value]
@@ -647,6 +655,32 @@ def extract_outputs(response_payload: dict[str, Any], task_id: str, config: Conf
                 output["revised_prompt"] = item["revised_prompt"]
             if output:
                 outputs.append(output)
+
+    response_output = response_payload.get("output")
+    if isinstance(response_output, list):
+        for item in response_output:
+            if not isinstance(item, dict) or item.get("type") != "image_generation_call":
+                continue
+            result = item.get("result")
+            if not isinstance(result, str) or not result:
+                continue
+            output: dict[str, Any] = {}
+            try:
+                saved = save_b64_image(
+                    config,
+                    task_id,
+                    len(outputs),
+                    result,
+                    str(item.get("output_format") or item.get("format") or "png"),
+                )
+                output.update(saved)
+            except Exception as exc:  # noqa: BLE001 - preserve result metadata if local save fails.
+                output["save_error"] = str(exc)
+            if isinstance(item.get("id"), str):
+                output["generation_id"] = item["id"]
+            if isinstance(item.get("revised_prompt"), str):
+                output["revised_prompt"] = item["revised_prompt"]
+            outputs.append(output)
     return outputs
 
 
@@ -915,6 +949,21 @@ class AsyncImageHandler(BaseHTTPRequestHandler):
                 return
             json_response(self, 202, task)
             return
+        if parsed.path in {"/v1/images/responses", "/images/responses"}:
+            api_key = self._require_bearer_token()
+            if not api_key:
+                return
+            try:
+                body = read_json_body(self, self.server.config.max_body_bytes)  # type: ignore[attr-defined]
+                task = self._submit_responses_image_request(body, api_key, None)
+            except QueueFullError as exc:
+                error_response(self, 503, "server_overloaded", str(exc))
+                return
+            except ValueError as exc:
+                error_response(self, 400, "invalid_request", str(exc))
+                return
+            json_response(self, 202, task)
+            return
         if parsed.path == "/v1/task/upload":
             api_key = self._require_bearer_token()
             if not api_key:
@@ -1088,8 +1137,27 @@ class AsyncImageHandler(BaseHTTPRequestHandler):
     ) -> dict[str, Any]:
         payload = dict(body)
         if "model" not in payload:
-            payload["model"] = "gpt-image-2"
+            if endpoint == "/v1/images/edits":
+                payload["model"] = self.server.config.default_edit_model  # type: ignore[attr-defined]
+            else:
+                payload["model"] = self.server.config.default_generation_model  # type: ignore[attr-defined]
         return self._create_task_from_payload(endpoint, payload, api_key, callback_url)
+
+    def _submit_responses_image_request(
+        self,
+        body: dict[str, Any],
+        api_key: str,
+        callback_url: str | None,
+    ) -> dict[str, Any]:
+        tools = body.get("tools")
+        if not isinstance(tools, list) or not any(
+            isinstance(tool, dict) and tool.get("type") == "image_generation"
+            for tool in tools
+        ):
+            raise ValueError("tools must include an image_generation tool")
+        if "input" not in body:
+            raise ValueError("input is required")
+        return self._create_task_from_payload("/v1/responses", dict(body), api_key, callback_url)
 
     def _submit_task(self, body: dict[str, Any], api_key: str) -> dict[str, Any]:
         endpoint = body.get("endpoint", "/v1/images/generations")
@@ -1102,9 +1170,12 @@ class AsyncImageHandler(BaseHTTPRequestHandler):
             "/images/edits": "/v1/images/edits",
             "edits": "/v1/images/edits",
             "edit": "/v1/images/edits",
+            "/v1/responses": "/v1/responses",
+            "responses": "/v1/responses",
+            "thinking": "/v1/responses",
         }
         if not isinstance(endpoint, str) or endpoint not in endpoint_aliases:
-            raise ValueError("endpoint must be /v1/images/generations or /v1/images/edits")
+            raise ValueError("endpoint must be generations, edits, or responses")
         endpoint = endpoint_aliases[endpoint]
 
         callback_url = body.get("callback_url")
@@ -1126,6 +1197,8 @@ class AsyncImageHandler(BaseHTTPRequestHandler):
 
         request_payload = dict(input_payload)
         request_payload["model"] = model
+        if endpoint == "/v1/responses":
+            return self._submit_responses_image_request(request_payload, api_key, callback_url)
         return self._create_task_from_payload(endpoint, request_payload, api_key, callback_url)
 
     def _submit_multipart_edit(self, api_key: str) -> dict[str, Any]:
@@ -1141,10 +1214,10 @@ class AsyncImageHandler(BaseHTTPRequestHandler):
             for field in fields:
                 filename = getattr(field, "filename", "") or ""
                 if filename:
-                    if key not in {"image", "mask"}:
+                    if key != "mask" and key != "image" and not key.startswith("image["):
                         continue
                     upload = self._save_uploaded_field(field, include_data_url=True)
-                    if key == "image":
+                    if key == "image" or key.startswith("image["):
                         image_urls.append({"image_url": upload["data_url"]})
                     else:
                         mask_url = upload["data_url"]
@@ -1159,7 +1232,7 @@ class AsyncImageHandler(BaseHTTPRequestHandler):
                     continue
                 if key == "callback_url":
                     callback_url = value
-                elif key == "image":
+                elif key == "image" or key.startswith("image["):
                     image_urls.append({"image_url": value})
                 elif key == "mask":
                     mask_url = value
@@ -1185,7 +1258,7 @@ class AsyncImageHandler(BaseHTTPRequestHandler):
         if callback_url and not is_public_callback_url(callback_url, self.server.config.allow_http_callback):  # type: ignore[attr-defined]
             raise ValueError("callback_url must be https URL")
         if "model" not in payload:
-            payload["model"] = "gpt-image-2"
+            payload["model"] = self.server.config.default_edit_model  # type: ignore[attr-defined]
         if not isinstance(payload.get("prompt"), str) or not str(payload.get("prompt")).strip():
             raise ValueError("prompt is required")
         if not image_urls:
@@ -1217,12 +1290,20 @@ def load_config() -> Config:
     parser.add_argument("--upload-dir", default=os.getenv("ASYNC_IMAGE_UPLOAD_DIR", "/data/uploads"))
     parser.add_argument("--upload-url-prefix", default=os.getenv("ASYNC_IMAGE_UPLOAD_URL_PREFIX", "/v1/task/uploads"))
     parser.add_argument("--public-base-url", default=os.getenv("ASYNC_IMAGE_PUBLIC_BASE_URL", ""))
+    parser.add_argument(
+        "--default-generation-model",
+        default=os.getenv("ASYNC_IMAGE_DEFAULT_GENERATION_MODEL", DEFAULT_GENERATION_MODEL),
+    )
+    parser.add_argument(
+        "--default-edit-model",
+        default=os.getenv("ASYNC_IMAGE_DEFAULT_EDIT_MODEL", DEFAULT_EDIT_MODEL),
+    )
     parser.add_argument("--workers", type=int, default=int(os.getenv("ASYNC_IMAGE_WORKERS", "2")))
     parser.add_argument("--max-queue-size", type=int, default=int(os.getenv("ASYNC_IMAGE_MAX_QUEUE_SIZE", "100")))
     parser.add_argument("--request-timeout", type=int, default=int(os.getenv("ASYNC_IMAGE_REQUEST_TIMEOUT_SECONDS", "900")))
     parser.add_argument("--callback-timeout", type=int, default=int(os.getenv("ASYNC_IMAGE_CALLBACK_TIMEOUT_SECONDS", "15")))
-    parser.add_argument("--max-body-bytes", type=int, default=int(os.getenv("ASYNC_IMAGE_MAX_BODY_BYTES", "1048576")))
-    parser.add_argument("--max-upload-bytes", type=int, default=int(os.getenv("ASYNC_IMAGE_MAX_UPLOAD_BYTES", str(20 << 20))))
+    parser.add_argument("--max-body-bytes", type=int, default=int(os.getenv("ASYNC_IMAGE_MAX_BODY_BYTES", str(70 << 20))))
+    parser.add_argument("--max-upload-bytes", type=int, default=int(os.getenv("ASYNC_IMAGE_MAX_UPLOAD_BYTES", str(50 << 20))))
     parser.add_argument(
         "--task-retention-seconds",
         type=int,
@@ -1246,6 +1327,10 @@ def load_config() -> Config:
         raise SystemExit("workers must be >= 1")
     if args.max_queue_size < 1:
         raise SystemExit("max queue size must be >= 1")
+    if not args.default_generation_model.strip():
+        raise SystemExit("default generation model must not be empty")
+    if not args.default_edit_model.strip():
+        raise SystemExit("default edit model must not be empty")
     if args.task_retention_seconds < 0:
         raise SystemExit("task retention seconds must be >= 0")
     if args.cleanup_interval_seconds < 1:
@@ -1263,6 +1348,8 @@ def load_config() -> Config:
         upload_dir=args.upload_dir,
         upload_url_prefix=args.upload_url_prefix,
         public_base_url=args.public_base_url,
+        default_generation_model=args.default_generation_model.strip(),
+        default_edit_model=args.default_edit_model.strip(),
         worker_count=args.workers,
         max_queue_size=args.max_queue_size,
         request_timeout_seconds=args.request_timeout,

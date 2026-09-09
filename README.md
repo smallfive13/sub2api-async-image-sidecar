@@ -1,6 +1,6 @@
 # Sub2API Async Image Sidecar
 
-Sub2API 图片请求的异步任务 Sidecar。它接收图片生成或编辑请求，在后台调用 Sub2API 的 OpenAI 兼容图片接口，并通过任务查询接口返回状态和结果。
+Sub2API 图片请求的异步任务 Sidecar。它接收图片生成、编辑或 Responses 图片工具请求，在后台调用 Sub2API，并通过任务查询接口返回状态和结果。默认使用 GPT Image 2.5 Flare 生成、Sunburst 编辑；调用方仍可显式指定其他兼容模型。
 
 ## 来源
 
@@ -14,6 +14,7 @@ c933fd429b4db3ff1e51888c3fdb5ede2eea27ae81e766f81cc0acf06ec3152d
 
 - `POST /v1/images/generations`：提交图片生成任务
 - `POST /v1/images/edits`：提交图片编辑任务
+- `POST /v1/images/responses`：提交 Responses 图片工具任务，支持推理辅助和多轮编辑
 - `POST /v1/task/submit`：统一提交生成或编辑任务，可配置回调
 - `GET /v1/task/{task_id}`：查询任务状态和结果
 
@@ -55,7 +56,7 @@ Sidecar 默认只监听宿主机 `127.0.0.1:8090`，并连接已经存在的 Sub
 - 清理线程每 `600` 秒执行一次。
 - 等待队列最多容纳 `100` 个任务；队列满时返回 HTTP `503 server_overloaded`。
 - 任务完成或失败后，立即清除原始请求和 API Key 密文。
-- SQLite 中的响应和输出不会持久化 `b64_json`；Base64 图片成功落盘后只返回文件 URL。
+- SQLite 中的响应和输出不会持久化 `b64_json` 或 Responses 图片调用的 `result`；Base64 图片成功落盘后只返回文件 URL。
 - 启动时会压缩旧版本留下的终态记录，并回收其 SQLite 空间。
 
 通过以下环境变量调整：
@@ -64,6 +65,8 @@ Sidecar 默认只监听宿主机 `127.0.0.1:8090`，并连接已经存在的 Sub
 ASYNC_IMAGE_TASK_RETENTION_SECONDS=86400
 ASYNC_IMAGE_CLEANUP_INTERVAL_SECONDS=600
 ASYNC_IMAGE_MAX_QUEUE_SIZE=100
+ASYNC_IMAGE_DEFAULT_GENERATION_MODEL=gpt-image-2.5-flare
+ASYNC_IMAGE_DEFAULT_EDIT_MODEL=gpt-image-2.5-sunburst
 ```
 
 将 `ASYNC_IMAGE_TASK_RETENTION_SECONDS` 设为 `0` 可以禁用自动过期。文件 URL 在对应文件过期后会返回 404。
@@ -74,10 +77,10 @@ ASYNC_IMAGE_MAX_QUEUE_SIZE=100
 PYTHONPATH=. python -m unittest discover -s tests -v
 ```
 
-测试覆盖终态数据压缩、TTL 清理、队列满载 503、积压任务恢复，以及从提交任务到读取生成图片的完整 HTTP 流程。
+测试覆盖终态数据压缩、TTL 清理、队列满载 503、积压任务恢复、GPT Image 2.5 参数透传，以及 Image API/Responses API 从提交任务到读取图片的完整 HTTP 流程。
 
 ## 剩余边界
 
-上游响应仍会先完整读入内存再解析，multipart 上传也会在 `ASYNC_IMAGE_MAX_UPLOAD_BYTES` 限制内完整读入内存。因此本次改造消除了长期持久化和无界队列导致的持续增长，但不能消除单个大请求的瞬时内存峰值。
+上游响应仍会先完整读入内存再解析，JSON 和 multipart 上传也会在各自限制内完整读入内存。因此当前实现控制了长期持久化和队列增长，但不能消除单个大请求的瞬时内存峰值。上传默认上限为 `50 MiB`；JSON 默认上限为 `70 MiB`，用于容纳约 `50 MiB` 图片的 Base64 膨胀。部署方可按内存预算调低。
 
 代码仍使用 Python 3.12 的 `cgi` 模块处理 multipart；该模块在 Python 3.13 已移除，升级基础镜像前需要替换 multipart 解析实现。
