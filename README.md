@@ -20,6 +20,30 @@ c933fd429b4db3ff1e51888c3fdb5ede2eea27ae81e766f81cc0acf06ec3152d
 
 服务器地址、鉴权、完整 curl 示例、图片下载和回调说明见 [API 使用说明](docs/API_USAGE.md)。
 
+## 模型选择与费用
+
+`gpt-image-2`、`gpt-image-2.5-flare` 和 `gpt-image-2.5-sunburst` 都支持图片生成和图片编辑，不是按“生图模型/编辑模型”硬性拆分。区别主要在速度、质量和价格：
+
+| 模型 | 定位 | 支持场景 | 质量档位 |
+| --- | --- | --- | --- |
+| `gpt-image-2.5-flare` | GPT Image 2.5 中速度优先 | 日常生图、快速编辑、批量草稿 | `low`、`medium`、`high`、`xhigh`、`max`、`auto` |
+| `gpt-image-2.5-sunburst` | GPT Image 2.5 中质量优先 | 高质量生图、精确编辑、主体和布局保持 | `low`、`medium`、`high`、`xhigh`、`max`、`auto` |
+| `gpt-image-2` | 兼容和成本优先的上一代基线 | 常规生图和编辑 | `low`、`medium`、`high`、`auto` |
+
+Sidecar 默认使用 Flare 生成、Sunburst 编辑；请求显式传入 `model` 时始终以请求值为准，因此仍可用 Sunburst 生图、Flare 编辑或继续调用 `gpt-image-2`。
+
+截至 2026-09-10，OpenAI 标准 API 的官方 token 单价如下，单位均为美元/100 万 tokens：
+
+| 模型 | 文本输入 | 图片输入 | 图片输出 |
+| --- | ---: | ---: | ---: |
+| `gpt-image-2.5-flare` | `$5.00` | `$8.00` | `$30.00` |
+| `gpt-image-2.5-sunburst` | `$5.00` | `$8.00` | `$30.00` |
+| `gpt-image-2` | `$2.50` | `$4.00` | `$15.00` |
+
+缓存输入价格分别为：GPT Image 2.5 文本 `$1.25`、图片 `$2.00`；GPT Image 2 文本 `$0.625`、图片 `$1.00`。每张图不是固定价，最终费用由实际输入、尺寸、质量和输出 token 数决定。编辑任务还会计入输入图片 token；通过 Responses API 进行推理辅助或多轮编辑时，还会叠加顶层推理模型的 token 费用。Sub2API 的最终扣费可能继续受到分组倍率和渠道定价影响。
+
+官方参考：[OpenAI Pricing](https://developers.openai.com/api/docs/pricing)、[GPT Image 2.5 Flare](https://developers.openai.com/api/docs/models/gpt-image-2.5-flare)、[GPT Image 2.5 Sunburst](https://developers.openai.com/api/docs/models/gpt-image-2.5-sunburst)、[GPT Image 2](https://developers.openai.com/api/docs/models/gpt-image-2)。
+
 ## 安全边界
 
 仓库不包含生产环境的 `.env`、SQLite 数据库、图片、上传文件或 API Key。不要提交以下内容：
