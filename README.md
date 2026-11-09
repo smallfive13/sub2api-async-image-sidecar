@@ -1,6 +1,8 @@
 # Sub2API Async Image Sidecar
 
-Sub2API 图片请求的异步任务 Sidecar。它接收图片生成、编辑或 Responses 图片工具请求，在后台调用 Sub2API，并通过任务查询接口返回状态和结果。默认使用 GPT Image 2.6 Flare 生成、Sunburst 编辑；调用方仍可显式指定其他兼容模型。
+图片请求的异步任务 Sidecar。它接收图片生成、编辑或 Responses 图片工具请求，在后台按 provider 调用 Sub2API 或原生 OpenAI，并通过任务查询接口返回状态和结果。默认使用 GPT Image 2.6 Flare 生成、Sunburst 编辑；调用方仍可显式指定其他兼容模型。
+
+支持 `provider=auto|sub2api|openai` 选路：常规图片默认走 Sub2API，SVG/GIF 自动选择原生 OpenAI；调用方可显式固定渠道，失败不会自动换渠道或模型。官方路由需要服务器 API Key、调用者允许名单及有效的 Sub2API 鉴权。Grok、Gemini 后续可使用相同字段接入，当前尚未实现。详见 [Provider 路由](docs/API_USAGE.md#provider-路由)。
 
 ## 来源
 
@@ -83,6 +85,24 @@ docker compose ps
 
 Sidecar 默认只监听宿主机 `127.0.0.1:8090`，并连接已经存在的 Sub2API Docker 网络。若网络名称不同，修改 `.env` 中的 `SUB2API_DOCKER_NETWORK`。
 
+使用原生 OpenAI 时，在服务器 Shell 设置环境变量后启动容器。`OPENAI_API_KEY` 是官方项目 Key，`ASYNC_IMAGE_OPENAI_ALLOWED_API_KEYS` 是允许使用该官方额度的调用者 Sub2API Key，可用逗号分隔多个。以下命令通过隐藏输入配置，不把 Key 写入本地配置文件或命令历史：
+
+例如允许名单只有你自己的一个 Sub2API Key 时，你仍用该 Key 请求 Sidecar；官方渠道由服务器代为调用，官方 Key 不返回给客户端。其他调用者仍可使用 Sub2API，但不能使用这把服务器官方 Key。这里配置的是 Sidecar 的调用权限，不会修改 OpenAI 组织或 API Key 的权限设置。
+
+```bash
+read -r -s -p "OpenAI server API key: " OPENAI_API_KEY
+printf '\n'
+export OPENAI_API_KEY
+read -r -s -p "Allowed caller Sub2API keys (comma separated): " ASYNC_IMAGE_OPENAI_ALLOWED_API_KEYS
+printf '\n'
+export ASYNC_IMAGE_OPENAI_ALLOWED_API_KEYS
+docker compose up -d --build async-image-sidecar
+```
+
+Compose 模板会把变量传入 Sidecar；单独在宿主机 `export` 不会修改已经运行的容器。原 VPS 的 `sub2api-async-image-mvp` 使用不同的 Compose 文件，需要在其服务环境中加入同名变量并重新创建该服务，不能直接套用上面的服务名。官方 Key 和允许名单为空时，Sub2API 常规请求仍可用，但 SVG/GIF 的自动路由会返回配置或授权错误。
+
+官方调用在提交和执行前各做一次 Sub2API Key 校验；不会通过 Sub2API 代理生成请求或记录该用量的扣费。官方 `usage`、实际 provider、选路原因和 request ID 保存在任务结果中。服务器官方 Key 不写入 SQLite，`Config` 的打印内容也不会包含它或允许名单。
+
 升级现有部署时，同时检查服务器 `.env` 中的 `ASYNC_IMAGE_DEFAULT_GENERATION_MODEL` 和 `ASYNC_IMAGE_DEFAULT_EDIT_MODEL`；显式设置的旧值会覆盖代码和 Compose 的新默认值。上游 Sub2API 也必须支持两个 2.6 模型及所需字段，账号模型映射和分组白名单需要允许这些模型。仅更新 Sidecar 不能保证上游可用或定价正确，应先显式指定模型完成真实生图和编辑验证，再切换线上默认值。
 
 ## 数据生命周期和过载保护
@@ -114,7 +134,7 @@ ASYNC_IMAGE_DEFAULT_EDIT_MODEL=gpt-image-2.6-sunburst
 PYTHONPATH=. python -m unittest discover -s tests -v
 ```
 
-测试使用本地模拟上游，覆盖终态数据压缩、TTL 清理、队列满载 503、积压任务恢复、2.6 参数和 markup 透传、SVG/GIF 的扩展名与下载 MIME、显式 2.5 模型兼容，以及 Image API/Responses API 从提交任务到读取图片的完整 HTTP 流程。真实模型和线上部署仍需单独验证。
+测试使用本地模拟的 Sub2API 与官方上游，覆盖 provider 自动/显式选路、服务端凭据隔离、调用者授权与撤销、无跨渠道重试、历史数据库升级、2.6 参数和 markup 透传、SVG/GIF 格式及下载 MIME、显式旧模型兼容，以及原有异步队列和清理流程。真实模型和线上部署需要单独验证。
 
 ## 剩余边界
 

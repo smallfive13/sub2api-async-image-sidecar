@@ -405,6 +405,7 @@ class EndToEndTest(unittest.TestCase):
             sidecar_thread.start()
             boundary = "sidecar-test-boundary"
             parts = [
+                f"--{boundary}\r\nContent-Disposition: form-data; name=\"provider\"\r\n\r\nsub2api\r\n".encode(),
                 f"--{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\npreserve subject\r\n".encode(),
                 f"--{boundary}\r\nContent-Disposition: form-data; name=\"quality\"\r\n\r\nxhigh\r\n".encode(),
             ]
@@ -447,6 +448,7 @@ class EndToEndTest(unittest.TestCase):
                         (submitted["id"],),
                     ).fetchone()
                 payload = json.loads(row["request_json"])
+                self.assertNotIn("provider", payload)
                 self.assertEqual(payload["model"], "gpt-image-2.6-sunburst")
                 self.assertEqual(payload["quality"], "xhigh")
                 self.assertEqual(payload["complexity"], "medium")
@@ -529,7 +531,7 @@ class EndToEndTest(unittest.TestCase):
                 "Content-Type": "application/json",
             }
             try:
-                payload = {"prompt": "test", "quality": "max", "size": "1536x864", "complexity": "low", "output_format": output_format}
+                payload = {"provider": "sub2api", "prompt": "test", "quality": "max", "size": "1536x864", "complexity": "low", "output_format": output_format}
                 if model:
                     payload["model"] = model
                 if output_format == "gif":
@@ -559,7 +561,8 @@ class EndToEndTest(unittest.TestCase):
                 self.assertEqual(task["status"], "completed")
                 self.assertEqual(task["model"], model or "gpt-image-2.6-flare")
                 self.assertEqual(task["response"]["usage"]["total_tokens"], 3)
-                self.assertEqual(FakeUpstreamHandler.requests[0], {**payload, "model": model or "gpt-image-2.6-flare"})
+                upstream_payload = {key: value for key, value in payload.items() if key != "provider"}
+                self.assertEqual(FakeUpstreamHandler.requests[0], {**upstream_payload, "model": model or "gpt-image-2.6-flare"})
                 self.assertEqual(FakeUpstreamHandler.requests[0]["quality"], "max")
                 self.assertEqual(FakeUpstreamHandler.requests[0]["size"], "1536x864")
                 self.assertNotIn("b64_json", json.dumps(task))

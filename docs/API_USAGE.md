@@ -42,9 +42,74 @@ curl -sS "$ASYNC_IMAGE_BASE_URL/health"
 {"status":"ok"}
 ```
 
+## Provider 路由
+
+`provider` 表示实际调用渠道，与 `model` 分开。JSON 图片请求和 Responses 请求在顶层传入；multipart 编辑使用 `-F "provider=openai"`；统一任务入口可在顶层或 `input` 内传入，顶层值优先。该字段由 Sidecar 消费，不会发送给上游。
+
+当前实现支持 `auto`、`sub2api`、`openai`；省略等同于 `auto`。Grok、Gemini 尚未接入，传入这些 provider 会返回 HTTP 400，后续实现对应渠道后可沿用相同的选路字段。
+
+| provider / 请求 | 实际渠道 |
+| --- | --- |
+| `auto`：Images API 请求 SVG 或 GIF | `openai` |
+| `auto`：其他 Images API 请求（包括旧模型的常规图片请求） | `sub2api` |
+| `auto`：Responses 图片工具请求 | `sub2api` |
+| `sub2api` | 固定 Sub2API，不因输出格式切换 |
+| `openai` | 固定官方 `https://api.openai.com/v1` |
+
+选路在任务提交时确定并持久化，队列恢复不会重新选路。上游失败、超时、额度不足或格式不支持时不会自动跨渠道重试，也不会自动换模型。Responses 多轮请求必须保持同一 provider；`previous_response_id` 不能跨渠道使用。
+
+使用官方渠道需要部署方配置服务器 `OPENAI_API_KEY`，并将调用者的 Sub2API Key 加入 `ASYNC_IMAGE_OPENAI_ALLOWED_API_KEYS`。客户端仍使用自己的 Sub2API Key 鉴权，不发送官方服务器 Key。Sidecar 在提交和执行官方任务前都会检查允许名单，并通过 Sub2API 的 `/v1/models` 验证调用者 Key 当前有效。未配置服务器 Key 返回 503，调用者未授权返回 403，鉴权服务不可用返回 503。
+
+两类 Key 的用途如下：
+
+| 配置或请求 | 使用的凭据 | 用途 |
+| --- | --- | --- |
+| 客户端 `Authorization: Bearer ...` | 调用者自己的 Sub2API Key | 提交和查询任务 |
+| 服务器 `ASYNC_IMAGE_OPENAI_ALLOWED_API_KEYS` | 获准使用官方渠道的 Sub2API Key，逗号分隔 | 限制哪些调用者可消耗服务器官方额度 |
+| 服务器 `OPENAI_API_KEY` | 官方 OpenAI 项目 Key | 仅由服务器在选中官方渠道时调用原生 API |
+
+例如只将自己的一个 Sub2API Key 放入允许名单，就只有持有该 Key 的调用者能通过 Sidecar 使用官方额度；其他 Key 请求官方路由会返回 403。官方 Key 不返回给客户端，此配置也不修改 OpenAI 组织或 Key 的权限设置。
+
+官方任务直接计入服务器 Key 所属 OpenAI 项目，不会自动计入 Sub2API 的用户扣费或限额。任务 `response.usage` 保留上游提供的用量，可用于核对官方账单；它不表示赠送余额或精确费用。该版本的路由功能需要部署后才对现有服务器生效，之前的线上验证结果见 [验证记录](IMAGE26_VALIDATION.md)。
+
+自动选择官方 GIF 路由：
+
+```bash
+curl -sS "$ASYNC_IMAGE_BASE_URL/v1/images/generations" \
+  -H "Authorization: Bearer $SUB2API_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "provider": "auto",
+    "model": "gpt-image-2.6-flare",
+    "prompt": "蓝色小球在白色背景上轻轻跳动，首尾衔接的循环动画",
+    "output_format": "gif",
+    "quality": "low",
+    "complexity": "low",
+    "size": "auto",
+    "frame_count": 4,
+    "frame_duration_ms": 200,
+    "n": 1
+  }'
+```
+
+接受任务的响应包含实际渠道和选路原因，终态查询还会在上游提供时返回 `upstream_request_id`：
+
+```json
+{
+  "id": "task_xxx",
+  "status": "queued",
+  "model": "gpt-image-2.6-flare",
+  "provider": "openai",
+  "route_reason": "native_gif",
+  "endpoint": "/v1/images/generations"
+}
+```
+
+`route_reason` 包括 `explicit_provider`、`native_svg`、`native_gif`、`default_sub2api`；升级前保存的任务标记为 `legacy_task`，仍走 Sub2API。查询任务继续要求提交时的同一个调用者 Key。回调中也包含这些渠道信息。
+
 ## 模型选择与旧版本兼容
 
-**旧模型仍可显式调用。** 本次升级修改了省略 `model` 时的默认值；显式传入的模型名会保留并发送给 Sub2API。
+**旧模型仍可显式调用。** 本次升级修改了省略 `model` 时的默认值；显式传入的模型名会保留并发送给选定的 provider。旧模型的常规图片请求默认保持 Sub2API 路由。
 
 | 调用方式 | 模型选择规则 |
 | --- | --- |
@@ -183,7 +248,7 @@ GPT Image 2.6 支持 `low`、`medium`、`high`、`xhigh`、`max` 和 `auto` 质�
 
 以下功能需要上游 Sub2API 和账号同时支持。Sidecar 的 JSON 请求透传这些字段，multipart 编辑也会保留 `complexity`、`markup`、`frame_count` 和 `frame_duration_ms`。现有部署如果仍显式配置 2.5 默认值，需更新配置并重新部署后才会切换到 2.6。
 
-2026-11-09 线上验证已通过 2.6 默认 PNG 生图和 multipart 编辑。当前订阅渠道的 SVG 请求实际返回 PNG，GIF 请求返回 HTTP 400：`GIF output is not enabled for this request.`；指定 `size=1024x1024` 也出现了其他实际像素尺寸。该渠道当前建议使用 PNG，按 `outputs[].file` 的实际扩展名和文件尺寸处理结果。下方 SVG/GIF 示例用于支持相应能力的上游；详细证据见 [升级验证记录](IMAGE26_VALIDATION.md)。
+2026-11-09 线上验证已通过 Sub2API 订阅渠道的 2.6 默认 PNG 生图和 multipart 编辑。该订阅渠道的 SVG 请求实际返回 PNG，GIF 请求返回 HTTP 400：`GIF output is not enabled for this request.`；指定 `size=1024x1024` 也出现了其他实际像素尺寸。直接调用官方 API 时已验证真正的 SVG 和四帧 GIF。启用本版本路由并授权后，下面的 Images API SVG/GIF 请求默认选官方渠道；固定 `provider=sub2api` 则保持订阅渠道。任务保存前会核验请求的 SVG/GIF 格式，格式不符时在 `outputs[].save_error` 中报告，全部输出均不可用时状态为 `partial_completed`，不会当作成功的格式转换。
 
 `complexity` 控制渲染前的规划程度，支持 `low`、`medium`、`high`，省略时上游默认为 `high`；它与渲染质量 `quality` 独立。建议用 `low` 做简单改色和草稿，复杂文字或布局再比较更高档位。
 
@@ -199,9 +264,13 @@ curl -sS "$ASYNC_IMAGE_BASE_URL/v1/images/generations" \
     "quality": "low",
     "complexity": "low",
     "output_format": "svg",
+    "provider": "openai",
+    "svg": {"model": "gpt-6.1-sol", "reasoning": {"effort": "low"}},
     "n": 1
   }'
 ```
+
+官方 SVG 选模能力开启时需要 `svg.model`。调用方未提供 `svg` 时，Sidecar 默认补充 `gpt-6.1-sol` 和 `reasoning.effort=low`，可通过 `ASYNC_IMAGE_DEFAULT_SVG_MODEL` 修改默认作者模型；显式 `svg` 对象会原样保留。如果项目未开启 SVG model selection，需传 `"svg": null` 以避免 Sidecar 补入该对象，并由官方决定是否支持。SVG 总费用包括参考图和矢量作者模型的费用。
 
 生成动画 GIF 时，将 `output_format` 设为 `gif`，可通过 `frame_count` 指定 2–16 帧（默认 9），通过 `frame_duration_ms` 指定每帧 20–2000 毫秒（默认 200，上游按 10 毫秒取整）。例如：
 
@@ -366,10 +435,22 @@ curl -sS "$ASYNC_IMAGE_BASE_URL/v1/task/submit" \
 | `202` | 异步任务已接受 |
 | `400` | JSON、参数或上传内容不合法 |
 | `401` | 未提供有效的 Bearer Token |
+| `403` | 调用者不在官方 provider 允许名单中，或调用者 Key 被 Sub2API 拒绝 |
 | `404` | 任务、图片或路由不存在；使用不同 API Key 查询任务也会返回 404 |
-| `503` | 等待队列已满，客户端应稍后重试 |
+| `503` | 等待队列已满、选定 provider 未配置或鉴权服务暂时不可用；检查 `error.code` |
+
+路由相关错误码：
+
+| `error.code` | 处理方式 |
+| --- | --- |
+| `provider_unavailable` | 服务器未配置官方 Key；由部署方补齐配置。不会自动改走 Sub2API |
+| `provider_forbidden` | 调用者不在允许名单；由部署方核对授权 |
+| `authentication_error` | 核对调用者 Sub2API Key 是否有效 |
+| `authentication_unavailable` | Sub2API 鉴权接口未能确认 Key 有效；恢复后再提交 |
+| `invalid_request` | 检查 provider 值、请求入口和参数；当前不支持 Grok/Gemini provider |
 
 - `response_format=b64_json` 仍会透传给 Sub2API，但 Sidecar 会将 Base64 解码成图片文件。任务查询结果不再返回或持久化 `b64_json` 或 Responses `result`，客户端应读取 `outputs[].url`。
+- 官方 Images API 始终返回 Base64；兼容请求中的 `response_format=b64_json` 会由 Sidecar 移除，`response_format=url` 在官方渠道会被拒绝。客户端统一从任务的 `outputs[].url` 下载。
 - 图片和上传文件的 URL 当前不要求鉴权，不应向无关人员公开。
 - 终态任务、生成图片和上传图片默认保留 24 小时，客户端需要在过期前下载或转存。
 - Windows PowerShell 建议使用 `curl.exe`，避免与 PowerShell 内置 `curl` 别名冲突。

@@ -10,8 +10,8 @@ It exposes:
   GET  /v1/task/{task_id}
   GET  /health
 
-The sidecar stores task state in SQLite and calls the existing Sub2API
-OpenAI-compatible image endpoint in a background worker thread.
+The sidecar stores task state and the selected provider in SQLite, then calls
+Sub2API or the native OpenAI API in a background worker thread.
 """
 
 from __future__ import annotations
@@ -34,19 +34,41 @@ import time
 import traceback
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import urlparse
+import xml.etree.ElementTree as ET
 
 
 TERMINAL_STATUSES = {"completed", "partial_completed", "failed", "cancelled"}
 DEFAULT_GENERATION_MODEL = "gpt-image-2.6-flare"
 DEFAULT_EDIT_MODEL = "gpt-image-2.6-sunburst"
+OPENAI_API_BASE_URL = "https://api.openai.com/v1"
 
 
 class QueueFullError(RuntimeError):
     pass
+
+
+class ProviderRequestError(ValueError):
+    def __init__(self, status: int, code: str, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+        self.code = code
+
+
+def select_provider(endpoint: str, payload: dict[str, Any]) -> tuple[str, str]:
+    requested = payload.get("provider", "auto")
+    if not isinstance(requested, str) or requested not in {"auto", "sub2api", "openai"}:
+        raise ValueError("provider must be auto, sub2api, or openai")
+    if requested != "auto":
+        return requested, "explicit_provider"
+    if endpoint != "/v1/responses":
+        output_format = str(payload.get("output_format", "")).strip().lower()
+        if output_format in {"svg", "gif"}:
+            return "openai", "native_" + output_format
+    return "sub2api", "default_sub2api"
 
 
 def now_ts() -> int:
@@ -68,6 +90,13 @@ def json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict[st
 
 def error_response(handler: BaseHTTPRequestHandler, status: int, code: str, message: str) -> None:
     json_response(handler, status, {"error": {"code": code, "message": message}})
+
+
+def submission_error_response(handler: BaseHTTPRequestHandler, error: ValueError) -> None:
+    if isinstance(error, ProviderRequestError):
+        error_response(handler, error.status, error.code, str(error))
+    else:
+        error_response(handler, 400, "invalid_request", str(error))
 
 
 def read_json_body(handler: BaseHTTPRequestHandler, max_bytes: int) -> dict[str, Any]:
@@ -173,6 +202,30 @@ class Config:
     task_retention_seconds: int
     cleanup_interval_seconds: int
     allow_http_callback: bool
+    openai_api_key: str = field(default="", repr=False)
+    openai_allowed_api_keys: tuple[str, ...] = field(default=(), repr=False)
+    default_svg_model: str = "gpt-6.1-sol"
+
+
+def authorize_openai(config: Config, api_key: str) -> None:
+    if not config.openai_api_key:
+        raise ProviderRequestError(503, "provider_unavailable", "OpenAI provider has no server API key configured")
+    if not any(secrets.compare_digest(api_key.encode(), allowed.encode()) for allowed in config.openai_allowed_api_keys):
+        raise ProviderRequestError(403, "provider_forbidden", "this API key is not allowed to use the OpenAI provider")
+    request = urllib.request.Request(
+        config.sub2api_base_url.rstrip("/") + "/v1/models",
+        headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=min(config.request_timeout_seconds, 15)) as response:
+            if response.status != 200:
+                raise ProviderRequestError(503, "authentication_unavailable", "could not validate the Sub2API API key")
+    except urllib.error.HTTPError as exc:
+        if exc.code in {401, 403}:
+            raise ProviderRequestError(exc.code, "authentication_error", "Sub2API rejected the caller API key") from exc
+        raise ProviderRequestError(503, "authentication_unavailable", "could not validate the Sub2API API key") from exc
+    except (urllib.error.URLError, TimeoutError) as exc:
+        raise ProviderRequestError(503, "authentication_unavailable", "could not validate the Sub2API API key") from exc
 
 
 def sanitize_persisted_response(value: Any) -> Any:
@@ -236,6 +289,12 @@ class TaskStore:
                 conn.execute("ALTER TABLE image_tasks ADD COLUMN api_key_fingerprint TEXT")
             if "api_key_ciphertext" not in existing_columns:
                 conn.execute("ALTER TABLE image_tasks ADD COLUMN api_key_ciphertext TEXT")
+            if "provider" not in existing_columns:
+                conn.execute("ALTER TABLE image_tasks ADD COLUMN provider TEXT NOT NULL DEFAULT 'sub2api'")
+            if "route_reason" not in existing_columns:
+                conn.execute("ALTER TABLE image_tasks ADD COLUMN route_reason TEXT NOT NULL DEFAULT 'legacy_task'")
+            if "upstream_request_id" not in existing_columns:
+                conn.execute("ALTER TABLE image_tasks ADD COLUMN upstream_request_id TEXT")
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS image_tasks_status_created_idx
@@ -257,6 +316,8 @@ class TaskStore:
         request_payload: dict[str, Any],
         api_key: str,
         callback_url: str | None,
+        provider: str = "sub2api",
+        route_reason: str = "legacy_task",
     ) -> dict[str, Any]:
         ts = now_ts()
         api_key_fingerprint = fingerprint_token(api_key, self.token_secret)
@@ -267,8 +328,8 @@ class TaskStore:
                 INSERT INTO image_tasks (
                     id, status, model, endpoint, request_json,
                     api_key_fingerprint, api_key_ciphertext, callback_url,
-                    created_at, updated_at
-                ) VALUES (?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)
+                    created_at, updated_at, provider, route_reason
+                ) VALUES (?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id,
@@ -280,6 +341,8 @@ class TaskStore:
                     callback_url,
                     ts,
                     ts,
+                    provider,
+                    route_reason,
                 ),
             )
         return self.get_task(task_id) or {}
@@ -315,6 +378,11 @@ class TaskStore:
                 """,
                 (ts, ts, task_id),
             )
+
+    def set_upstream_request_id(self, task_id: str, request_id: str | None) -> None:
+        if request_id:
+            with self._lock, self.connect() as conn:
+                conn.execute("UPDATE image_tasks SET upstream_request_id = ? WHERE id = ?", (request_id, task_id))
 
     def complete_task(
         self,
@@ -500,12 +568,16 @@ class TaskStore:
             "status": row["status"],
             "model": row["model"],
             "endpoint": row["endpoint"],
+            "provider": row["provider"],
+            "route_reason": row["route_reason"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
         for field in ("started_at", "completed_at"):
             if row[field] is not None:
                 task[field] = row[field]
+        if row["upstream_request_id"]:
+            task["upstream_request_id"] = row["upstream_request_id"]
         if outputs is not None:
             task["outputs"] = outputs
         if response is not None:
@@ -567,9 +639,22 @@ def public_file_url(config: Config, url_prefix: str, filename: str) -> str:
     return config.public_base_url.rstrip("/") + path
 
 
-def save_b64_image(config: Config, task_id: str, index: int, b64_value: str, output_format: str) -> dict[str, str]:
+def save_b64_image(
+    config: Config, task_id: str, index: int, b64_value: str, output_format: str,
+    expected_format: str = "",
+) -> dict[str, str]:
     raw = base64.b64decode(strip_data_url_prefix(b64_value), validate=True)
     ext = detect_image_extension(raw, output_format)
+    if expected_format == "gif" and not raw.startswith((b"GIF87a", b"GIF89a")):
+        raise ValueError("upstream did not return the requested GIF format")
+    if expected_format == "svg":
+        try:
+            root = ET.fromstring(raw)
+        except ET.ParseError as exc:
+            raise ValueError("upstream did not return the requested SVG format") from exc
+        if root.tag.rsplit("}", 1)[-1] != "svg":
+            raise ValueError("upstream did not return the requested SVG format")
+        ext = "svg"
     filename = f"{task_id}_{index}.{ext}"
     os.makedirs(config.image_dir, exist_ok=True)
     path = os.path.join(config.image_dir, filename)
@@ -639,6 +724,7 @@ def extract_outputs(
     response_payload: dict[str, Any], task_id: str, config: Config, output_format: str = "png"
 ) -> list[dict[str, Any]]:
     outputs: list[dict[str, Any]] = []
+    expected_format = output_format.strip().lower()
     output_format = str(response_payload.get("output_format") or output_format)
     data = response_payload.get("data")
     if isinstance(data, list):
@@ -656,6 +742,7 @@ def extract_outputs(
                         index,
                         item["b64_json"],
                         str(item.get("output_format") or item.get("format") or output_format),
+                        expected_format,
                     )
                     output.update(saved)
                 except Exception as exc:  # noqa: BLE001 - preserve result if local save fails.
@@ -819,7 +906,7 @@ class WorkerPool:
         self.store.mark_in_progress(task_id)
         payload, api_key = self._load_internal_request(task_id)
         try:
-            response_payload = self._call_sub2api(task["endpoint"], payload, api_key)
+            response_payload = self._call_provider(task, payload, api_key)
             outputs = extract_outputs(response_payload, task_id, self.config, str(payload.get("output_format") or "png"))
             final_task = self.store.complete_task(task_id, response_payload, outputs)
         except Exception as exc:  # noqa: BLE001 - persist upstream failure as task failure.
@@ -839,8 +926,19 @@ class WorkerPool:
             raise RuntimeError("task has no stored API key; resubmit it with Authorization: Bearer <Sub2API key>")
         return json.loads(row["request_json"]), unprotect_token(api_key_ciphertext, self.store.token_secret)
 
-    def _call_sub2api(self, endpoint: str, payload: dict[str, Any], api_key: str) -> dict[str, Any]:
-        base = self.config.sub2api_base_url.rstrip("/")
+    def _call_provider(self, task: dict[str, Any], payload: dict[str, Any], api_key: str) -> dict[str, Any]:
+        provider = task["provider"]
+        if provider == "openai":
+            authorize_openai(self.config, api_key)
+            base = OPENAI_API_BASE_URL
+            upstream_key = self.config.openai_api_key
+            endpoint = task["endpoint"].removeprefix("/v1")
+        elif provider == "sub2api":
+            base = self.config.sub2api_base_url.rstrip("/")
+            upstream_key = api_key
+            endpoint = task["endpoint"]
+        else:
+            raise RuntimeError(f"unsupported stored provider: {provider}")
         url = f"{base}{endpoint}"
         raw = json_dumps(payload).encode("utf-8")
         req = urllib.request.Request(
@@ -848,20 +946,22 @@ class WorkerPool:
             data=raw,
             method="POST",
             headers={
-                "Authorization": f"Bearer {api_key}",
+                "Authorization": f"Bearer {upstream_key}",
                 "Content-Type": "application/json",
                 "Accept": "application/json",
             },
         )
         try:
             with urllib.request.urlopen(req, timeout=self.config.request_timeout_seconds) as resp:
+                self.store.set_upstream_request_id(task["id"], resp.headers.get("x-request-id"))
                 body = resp.read()
         except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"sub2api HTTP {exc.code}: {body[:1000]}") from exc
+            self.store.set_upstream_request_id(task["id"], exc.headers.get("x-request-id"))
+            body = exc.read().decode("utf-8", errors="replace").replace(upstream_key, "[redacted]")
+            raise RuntimeError(f"{provider} HTTP {exc.code}: {body[:1000]}") from exc
         parsed = json.loads(body.decode("utf-8"))
         if not isinstance(parsed, dict):
-            raise RuntimeError("sub2api response must be a JSON object")
+            raise RuntimeError(f"{provider} response must be a JSON object")
         return parsed
 
     def _send_callback_if_needed(self, task: dict[str, Any]) -> None:
@@ -940,7 +1040,7 @@ class AsyncImageHandler(BaseHTTPRequestHandler):
                 error_response(self, 503, "server_overloaded", str(exc))
                 return
             except ValueError as exc:
-                error_response(self, 400, "invalid_request", str(exc))
+                submission_error_response(self, exc)
                 return
             json_response(self, 202, task)
             return
@@ -954,7 +1054,7 @@ class AsyncImageHandler(BaseHTTPRequestHandler):
                 error_response(self, 503, "server_overloaded", str(exc))
                 return
             except ValueError as exc:
-                error_response(self, 400, "invalid_request", str(exc))
+                submission_error_response(self, exc)
                 return
             json_response(self, 202, task)
             return
@@ -969,7 +1069,7 @@ class AsyncImageHandler(BaseHTTPRequestHandler):
                 error_response(self, 503, "server_overloaded", str(exc))
                 return
             except ValueError as exc:
-                error_response(self, 400, "invalid_request", str(exc))
+                submission_error_response(self, exc)
                 return
             json_response(self, 202, task)
             return
@@ -980,7 +1080,7 @@ class AsyncImageHandler(BaseHTTPRequestHandler):
             try:
                 upload = self._upload_file()
             except ValueError as exc:
-                error_response(self, 400, "invalid_request", str(exc))
+                submission_error_response(self, exc)
                 return
             json_response(self, 201, upload)
             return
@@ -997,7 +1097,7 @@ class AsyncImageHandler(BaseHTTPRequestHandler):
             error_response(self, 503, "server_overloaded", str(exc))
             return
         except ValueError as exc:
-            error_response(self, 400, "invalid_request", str(exc))
+            submission_error_response(self, exc)
             return
         json_response(self, 202, task)
 
@@ -1120,6 +1220,25 @@ class AsyncImageHandler(BaseHTTPRequestHandler):
         model = model.strip()
         request_payload = dict(payload)
         request_payload["model"] = model
+        provider, route_reason = select_provider(endpoint, request_payload)
+        request_payload.pop("provider", None)
+        if provider == "openai":
+            if request_payload.get("stream"):
+                raise ValueError("the async OpenAI provider requires stream=false")
+            if endpoint != "/v1/responses":
+                response_format = request_payload.pop("response_format", "b64_json")
+                if response_format != "b64_json":
+                    raise ValueError("the OpenAI provider returns base64 images; response_format must be omitted or b64_json")
+                output_format = str(request_payload.get("output_format", "")).strip().lower()
+                if output_format == "svg":
+                    if endpoint != "/v1/images/generations":
+                        raise ValueError("SVG output requires the image generations endpoint")
+                    if "svg" not in request_payload:
+                        request_payload["svg"] = {
+                            "model": self.server.config.default_svg_model,  # type: ignore[attr-defined]
+                            "reasoning": {"effort": "low"},
+                        }
+            authorize_openai(self.server.config, api_key)  # type: ignore[attr-defined]
         if endpoint == "/v1/images/edits":
             request_payload = normalize_edit_request_payload(request_payload)
 
@@ -1131,6 +1250,8 @@ class AsyncImageHandler(BaseHTTPRequestHandler):
             request_payload=request_payload,
             api_key=api_key,
             callback_url=callback_url,
+            provider=provider,
+            route_reason=route_reason,
         )
         if not self.server.worker_pool.enqueue(task_id):  # type: ignore[attr-defined]
             self.server.store.delete_task(task_id)  # type: ignore[attr-defined]
@@ -1206,6 +1327,8 @@ class AsyncImageHandler(BaseHTTPRequestHandler):
 
         request_payload = dict(input_payload)
         request_payload["model"] = model
+        if "provider" in body:
+            request_payload["provider"] = body["provider"]
         if endpoint == "/v1/responses":
             return self._submit_responses_image_request(request_payload, api_key, callback_url)
         return self._create_task_from_payload(endpoint, request_payload, api_key, callback_url)
@@ -1247,6 +1370,7 @@ class AsyncImageHandler(BaseHTTPRequestHandler):
                     overlay_urls[key] = value
                 elif key in {
                     "model",
+                    "provider",
                     "prompt",
                     "size",
                     "quality",
@@ -1369,6 +1493,11 @@ def load_config() -> Config:
         task_retention_seconds=args.task_retention_seconds,
         cleanup_interval_seconds=args.cleanup_interval_seconds,
         allow_http_callback=args.allow_http_callback,
+        openai_api_key=os.getenv("OPENAI_API_KEY", "").strip(),
+        openai_allowed_api_keys=tuple(
+            key.strip() for key in os.getenv("ASYNC_IMAGE_OPENAI_ALLOWED_API_KEYS", "").split(",") if key.strip()
+        ),
+        default_svg_model=os.getenv("ASYNC_IMAGE_DEFAULT_SVG_MODEL", "gpt-6.1-sol").strip(),
     )
 
 
