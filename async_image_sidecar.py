@@ -41,8 +41,8 @@ from urllib.parse import urlparse
 
 
 TERMINAL_STATUSES = {"completed", "partial_completed", "failed", "cancelled"}
-DEFAULT_GENERATION_MODEL = "gpt-image-2.5-flare"
-DEFAULT_EDIT_MODEL = "gpt-image-2.5-sunburst"
+DEFAULT_GENERATION_MODEL = "gpt-image-2.6-flare"
+DEFAULT_EDIT_MODEL = "gpt-image-2.6-sunburst"
 
 
 class QueueFullError(RuntimeError):
@@ -526,7 +526,9 @@ def normalize_output_format(output_format: str) -> str:
         output_format = output_format.rsplit("/", 1)[-1]
     if output_format == "jpeg":
         return "jpg"
-    if output_format in {"png", "jpg", "webp"}:
+    if output_format == "svg+xml":
+        return "svg"
+    if output_format in {"png", "jpg", "webp", "svg", "gif"}:
         return output_format
     return "png"
 
@@ -538,6 +540,8 @@ def detect_image_extension(data: bytes, output_format: str) -> str:
         return "jpg"
     if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
         return "webp"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "gif"
     return normalize_output_format(output_format)
 
 
@@ -616,21 +620,26 @@ def normalize_edit_request_payload(payload: dict[str, Any]) -> dict[str, Any]:
         if images:
             normalized["images"] = images
 
-    if "mask" in normalized:
-        mask = normalized["mask"]
-        if isinstance(mask, str):
-            ref = normalize_image_ref(mask)
+    for field in ("mask", "markup"):
+        if field not in normalized:
+            continue
+        image = normalized[field]
+        if isinstance(image, str):
+            ref = normalize_image_ref(image)
             if isinstance(ref, str) and ref:
-                normalized["mask"] = {"image_url": ref}
-        elif isinstance(mask, dict):
-            mask_url = normalize_image_ref(mask.get("image_url"))
-            if isinstance(mask_url, str) and mask_url:
-                normalized["mask"] = {"image_url": mask_url}
+                normalized[field] = {"image_url": ref}
+        elif isinstance(image, dict):
+            image_url = normalize_image_ref(image.get("image_url"))
+            if isinstance(image_url, str) and image_url:
+                normalized[field] = {"image_url": image_url}
     return normalized
 
 
-def extract_outputs(response_payload: dict[str, Any], task_id: str, config: Config) -> list[dict[str, Any]]:
+def extract_outputs(
+    response_payload: dict[str, Any], task_id: str, config: Config, output_format: str = "png"
+) -> list[dict[str, Any]]:
     outputs: list[dict[str, Any]] = []
+    output_format = str(response_payload.get("output_format") or output_format)
     data = response_payload.get("data")
     if isinstance(data, list):
         for index, item in enumerate(data):
@@ -646,7 +655,7 @@ def extract_outputs(response_payload: dict[str, Any], task_id: str, config: Conf
                         task_id,
                         index,
                         item["b64_json"],
-                        str(item.get("output_format") or item.get("format") or "png"),
+                        str(item.get("output_format") or item.get("format") or output_format),
                     )
                     output.update(saved)
                 except Exception as exc:  # noqa: BLE001 - preserve result if local save fails.
@@ -671,7 +680,7 @@ def extract_outputs(response_payload: dict[str, Any], task_id: str, config: Conf
                     task_id,
                     len(outputs),
                     result,
-                    str(item.get("output_format") or item.get("format") or "png"),
+                    str(item.get("output_format") or item.get("format") or output_format),
                 )
                 output.update(saved)
             except Exception as exc:  # noqa: BLE001 - preserve result metadata if local save fails.
@@ -811,7 +820,7 @@ class WorkerPool:
         payload, api_key = self._load_internal_request(task_id)
         try:
             response_payload = self._call_sub2api(task["endpoint"], payload, api_key)
-            outputs = extract_outputs(response_payload, task_id, self.config)
+            outputs = extract_outputs(response_payload, task_id, self.config, str(payload.get("output_format") or "png"))
             final_task = self.store.complete_task(task_id, response_payload, outputs)
         except Exception as exc:  # noqa: BLE001 - persist upstream failure as task failure.
             final_task = self.store.fail_task(task_id, str(exc))
@@ -1205,7 +1214,7 @@ class AsyncImageHandler(BaseHTTPRequestHandler):
         form = self._parse_multipart_form(self.server.config.max_upload_bytes)  # type: ignore[attr-defined]
         payload: dict[str, Any] = {}
         image_urls: list[dict[str, str]] = []
-        mask_url = ""
+        overlay_urls: dict[str, str] = {}
         callback_url = ""
 
         for key in form.keys():
@@ -1214,13 +1223,13 @@ class AsyncImageHandler(BaseHTTPRequestHandler):
             for field in fields:
                 filename = getattr(field, "filename", "") or ""
                 if filename:
-                    if key != "mask" and key != "image" and not key.startswith("image["):
+                    if key not in {"mask", "markup", "image"} and not key.startswith("image["):
                         continue
                     upload = self._save_uploaded_field(field, include_data_url=True)
                     if key == "image" or key.startswith("image["):
                         image_urls.append({"image_url": upload["data_url"]})
                     else:
-                        mask_url = upload["data_url"]
+                        overlay_urls[key] = upload["data_url"]
                     continue
                 raw_value = field.value
                 if isinstance(raw_value, bytes):
@@ -1234,13 +1243,14 @@ class AsyncImageHandler(BaseHTTPRequestHandler):
                     callback_url = value
                 elif key == "image" or key.startswith("image["):
                     image_urls.append({"image_url": value})
-                elif key == "mask":
-                    mask_url = value
+                elif key in {"mask", "markup"}:
+                    overlay_urls[key] = value
                 elif key in {
                     "model",
                     "prompt",
                     "size",
                     "quality",
+                    "complexity",
                     "response_format",
                     "background",
                     "output_format",
@@ -1249,7 +1259,7 @@ class AsyncImageHandler(BaseHTTPRequestHandler):
                     "input_fidelity",
                 }:
                     payload[key] = value
-                elif key in {"n", "output_compression", "partial_images"}:
+                elif key in {"n", "output_compression", "partial_images", "frame_count", "frame_duration_ms"}:
                     try:
                         payload[key] = int(value)
                     except ValueError as exc:
@@ -1264,8 +1274,8 @@ class AsyncImageHandler(BaseHTTPRequestHandler):
         if not image_urls:
             raise ValueError("multipart field image is required")
         payload["images"] = image_urls
-        if mask_url:
-            payload["mask"] = {"image_url": mask_url}
+        for field, image_url in overlay_urls.items():
+            payload[field] = {"image_url": image_url}
         return self._create_task_from_payload("/v1/images/edits", payload, api_key, callback_url or None)
 
 

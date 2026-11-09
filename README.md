@@ -1,6 +1,6 @@
 # Sub2API Async Image Sidecar
 
-Sub2API 图片请求的异步任务 Sidecar。它接收图片生成、编辑或 Responses 图片工具请求，在后台调用 Sub2API，并通过任务查询接口返回状态和结果。默认使用 GPT Image 2.5 Flare 生成、Sunburst 编辑；调用方仍可显式指定其他兼容模型。
+Sub2API 图片请求的异步任务 Sidecar。它接收图片生成、编辑或 Responses 图片工具请求，在后台调用 Sub2API，并通过任务查询接口返回状态和结果。默认使用 GPT Image 2.6 Flare 生成、Sunburst 编辑；调用方仍可显式指定其他兼容模型。
 
 ## 来源
 
@@ -22,27 +22,38 @@ c933fd429b4db3ff1e51888c3fdb5ede2eea27ae81e766f81cc0acf06ec3152d
 
 ## 模型选择与费用
 
-`gpt-image-2`、`gpt-image-2.5-flare` 和 `gpt-image-2.5-sunburst` 都支持图片生成和图片编辑，不是按“生图模型/编辑模型”硬性拆分。区别主要在速度、质量和价格：
+GPT Image 2.6 的 Flare 和 Sunburst 都支持图片生成和编辑。Flare 适合快速迭代，Sunburst 适合精细构图和编辑。2.6 通过 Images API 新增 `complexity`、markup 引导编辑、SVG 和动画 GIF 输出。
 
 | 模型 | 定位 | 支持场景 | 质量档位 |
 | --- | --- | --- | --- |
+| `gpt-image-2.6-flare` | 默认生图模型，速度优先 | 日常生图、快速编辑、SVG 和动画 GIF | `low`、`medium`、`high`、`xhigh`、`max`、`auto` |
+| `gpt-image-2.6-sunburst` | 默认编辑模型，精细视觉工作 | 复杂布局、文字、精确编辑、SVG 和动画 GIF | `low`、`medium`、`high`、`xhigh`、`max`、`auto` |
 | `gpt-image-2.5-flare` | GPT Image 2.5 中速度优先 | 日常生图、快速编辑、批量草稿 | `low`、`medium`、`high`、`xhigh`、`max`、`auto` |
 | `gpt-image-2.5-sunburst` | GPT Image 2.5 中质量优先 | 高质量生图、精确编辑、主体和布局保持 | `low`、`medium`、`high`、`xhigh`、`max`、`auto` |
-| `gpt-image-2` | 兼容和成本优先的上一代基线 | 常规生图和编辑 | `low`、`medium`、`high`、`auto` |
+| `gpt-image-2` | 上一代基线 | 常规生图和编辑 | `low`、`medium`、`high`、`auto` |
+| `gpt-image-1.5` | 更早的兼容模型 | 常规生图和编辑，取决于上游权限 | `low`、`medium`、`high`、`auto` |
 
-Sidecar 默认使用 Flare 生成、Sunburst 编辑；请求显式传入 `model` 时始终以请求值为准，因此仍可用 Sunburst 生图、Flare 编辑或继续调用 `gpt-image-2`。
+Sidecar 默认使用 2.6 Flare 生成、2.6 Sunburst 编辑；请求显式传入 `model` 时始终以请求值为准，因此仍可用 Sunburst 生图、Flare 编辑或继续调用 2.5 和 `gpt-image-2`。
 
-截至 2026-09-10，OpenAI 标准 API 的官方 token 单价如下，单位均为美元/100 万 tokens：
+旧客户端已指定 `model` 时无需改动。旧客户端省略 `model` 时会切换到 2.6；要保留旧模型行为，应显式填写 `gpt-image-2.5-flare` 或 `gpt-image-2.5-sunburst`。各模型使用自身支持的参数，调用仍受账号和分组模型权限约束。旧版调用示例和各接口选模规则见 [模型选择与旧版本兼容](docs/API_USAGE.md#模型选择与旧版本兼容)。
+
+2026-11-09 升级后的线上兼容性验证已通过：2.5 Flare 生图、2.5 Sunburst 编辑、`gpt-image-2` 和 `gpt-image-1.5` 生图，均完成任务并成功下载 PNG。
+
+2026-11-09 核对的 GPT Image 2.6 标准 API 单价如下；2.5 和 GPT Image 2 的数值保留自 2026-09-10 的记录。单位均为美元/100 万 tokens：
 
 | 模型 | 文本输入 | 图片输入 | 图片输出 |
 | --- | ---: | ---: | ---: |
+| `gpt-image-2.6-flare` | `$5.00` | `$8.00` | `$30.00` |
+| `gpt-image-2.6-sunburst` | `$5.00` | `$8.00` | `$30.00` |
 | `gpt-image-2.5-flare` | `$5.00` | `$8.00` | `$30.00` |
 | `gpt-image-2.5-sunburst` | `$5.00` | `$8.00` | `$30.00` |
 | `gpt-image-2` | `$2.50` | `$4.00` | `$15.00` |
 
-缓存输入价格分别为：GPT Image 2.5 文本 `$1.25`、图片 `$2.00`；GPT Image 2 文本 `$0.625`、图片 `$1.00`。每张图不是固定价，最终费用由实际输入、尺寸、质量和输出 token 数决定。编辑任务还会计入输入图片 token；通过 Responses API 进行推理辅助或多轮编辑时，还会叠加顶层推理模型的 token 费用。Sub2API 的最终扣费可能继续受到分组倍率和渠道定价影响。
+缓存输入价格分别为：GPT Image 2.6 和 2.5 文本 `$1.25`、图片 `$2.00`；GPT Image 2 文本 `$0.625`、图片 `$1.00`。每张图不是固定价，最终费用由实际输入、尺寸、质量和输出 token 数决定。编辑任务还会计入输入图片 token；通过 Responses API 进行推理辅助或多轮编辑时，还会叠加顶层推理模型的 token 费用。SVG 还包含将参考图转换成矢量的模型费用。`complexity` 没有单独收费。Sub2API 的最终扣费可能继续受到分组倍率和渠道定价影响。
 
-官方参考：[OpenAI Pricing](https://developers.openai.com/api/docs/pricing)、[GPT Image 2.5 Flare](https://developers.openai.com/api/docs/models/gpt-image-2.5-flare)、[GPT Image 2.5 Sunburst](https://developers.openai.com/api/docs/models/gpt-image-2.5-sunburst)、[GPT Image 2](https://developers.openai.com/api/docs/models/gpt-image-2)。
+官方参考：[图片生成指南](https://developers.openai.com/api/docs/guides/image-generation)、[GPT Image 2.6 Flare](https://developers.openai.com/api/docs/models/gpt-image-2.6-flare)、[GPT Image 2.6 Sunburst](https://developers.openai.com/api/docs/models/gpt-image-2.6-sunburst)、[OpenAI Pricing](https://developers.openai.com/api/docs/pricing)。
+
+2026-11-09 现有订阅渠道实测：默认 2.6 Flare PNG 生图和 2.6 Sunburst multipart 编辑已通过；请求 SVG 实际返回 PNG，GIF 返回“未启用”，指定 size 与实际像素也存在差异。建议该渠道使用 PNG，并读取实际文件格式、尺寸。完整结果见 [升级验证记录](docs/IMAGE26_VALIDATION.md)。
 
 ## 安全边界
 
@@ -72,6 +83,8 @@ docker compose ps
 
 Sidecar 默认只监听宿主机 `127.0.0.1:8090`，并连接已经存在的 Sub2API Docker 网络。若网络名称不同，修改 `.env` 中的 `SUB2API_DOCKER_NETWORK`。
 
+升级现有部署时，同时检查服务器 `.env` 中的 `ASYNC_IMAGE_DEFAULT_GENERATION_MODEL` 和 `ASYNC_IMAGE_DEFAULT_EDIT_MODEL`；显式设置的旧值会覆盖代码和 Compose 的新默认值。上游 Sub2API 也必须支持两个 2.6 模型及所需字段，账号模型映射和分组白名单需要允许这些模型。仅更新 Sidecar 不能保证上游可用或定价正确，应先显式指定模型完成真实生图和编辑验证，再切换线上默认值。
+
 ## 数据生命周期和过载保护
 
 默认配置：
@@ -89,8 +102,8 @@ Sidecar 默认只监听宿主机 `127.0.0.1:8090`，并连接已经存在的 Sub
 ASYNC_IMAGE_TASK_RETENTION_SECONDS=86400
 ASYNC_IMAGE_CLEANUP_INTERVAL_SECONDS=600
 ASYNC_IMAGE_MAX_QUEUE_SIZE=100
-ASYNC_IMAGE_DEFAULT_GENERATION_MODEL=gpt-image-2.5-flare
-ASYNC_IMAGE_DEFAULT_EDIT_MODEL=gpt-image-2.5-sunburst
+ASYNC_IMAGE_DEFAULT_GENERATION_MODEL=gpt-image-2.6-flare
+ASYNC_IMAGE_DEFAULT_EDIT_MODEL=gpt-image-2.6-sunburst
 ```
 
 将 `ASYNC_IMAGE_TASK_RETENTION_SECONDS` 设为 `0` 可以禁用自动过期。文件 URL 在对应文件过期后会返回 404。
@@ -101,7 +114,7 @@ ASYNC_IMAGE_DEFAULT_EDIT_MODEL=gpt-image-2.5-sunburst
 PYTHONPATH=. python -m unittest discover -s tests -v
 ```
 
-测试覆盖终态数据压缩、TTL 清理、队列满载 503、积压任务恢复、GPT Image 2.5 参数透传，以及 Image API/Responses API 从提交任务到读取图片的完整 HTTP 流程。
+测试使用本地模拟上游，覆盖终态数据压缩、TTL 清理、队列满载 503、积压任务恢复、2.6 参数和 markup 透传、SVG/GIF 的扩展名与下载 MIME、显式 2.5 模型兼容，以及 Image API/Responses API 从提交任务到读取图片的完整 HTTP 流程。真实模型和线上部署仍需单独验证。
 
 ## 剩余边界
 

@@ -44,8 +44,8 @@ def make_config(
         upload_dir=os.path.join(root, "uploads"),
         upload_url_prefix="/v1/task/uploads",
         public_base_url="",
-        default_generation_model="gpt-image-2.5-flare",
-        default_edit_model="gpt-image-2.5-sunburst",
+        default_generation_model="gpt-image-2.6-flare",
+        default_edit_model="gpt-image-2.6-sunburst",
         worker_count=1,
         max_queue_size=max_queue_size,
         request_timeout_seconds=5,
@@ -408,6 +408,8 @@ class EndToEndTest(unittest.TestCase):
                 f"--{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\npreserve subject\r\n".encode(),
                 f"--{boundary}\r\nContent-Disposition: form-data; name=\"quality\"\r\n\r\nxhigh\r\n".encode(),
             ]
+            for key, value in {"complexity": "medium", "output_format": "gif", "frame_count": "4", "frame_duration_ms": "200"}.items():
+                parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{key}\"\r\n\r\n{value}\r\n".encode())
             for index, content in enumerate((b"first-image", b"second-image")):
                 parts.append(
                     (
@@ -418,6 +420,10 @@ class EndToEndTest(unittest.TestCase):
                     + content
                     + b"\r\n"
                 )
+            parts.append(
+                f"--{boundary}\r\nContent-Disposition: form-data; name=\"markup\"; filename=\"overlay.png\"\r\nContent-Type: image/png\r\n\r\n".encode()
+                + b"transparent-overlay\r\n"
+            )
             parts.append(f"--{boundary}--\r\n".encode())
             body = b"".join(parts)
             try:
@@ -434,15 +440,21 @@ class EndToEndTest(unittest.TestCase):
                     self.assertEqual(response.status, 202)
                     submitted = json.loads(response.read().decode("utf-8"))
 
-                self.assertEqual(submitted["model"], "gpt-image-2.5-sunburst")
+                self.assertEqual(submitted["model"], "gpt-image-2.6-sunburst")
                 with store.connect() as conn:
                     row = conn.execute(
                         "SELECT request_json FROM image_tasks WHERE id = ?",
                         (submitted["id"],),
                     ).fetchone()
                 payload = json.loads(row["request_json"])
-                self.assertEqual(payload["model"], "gpt-image-2.5-sunburst")
+                self.assertEqual(payload["model"], "gpt-image-2.6-sunburst")
                 self.assertEqual(payload["quality"], "xhigh")
+                self.assertEqual(payload["complexity"], "medium")
+                self.assertEqual(payload["output_format"], "gif")
+                self.assertEqual(payload["frame_count"], 4)
+                self.assertEqual(payload["frame_duration_ms"], 200)
+                markup = payload["markup"]["image_url"]
+                self.assertEqual(base64.b64decode(markup.split(",", 1)[1]), b"transparent-overlay")
                 self.assertEqual(len(payload["images"]), 2)
                 self.assertTrue(all(image["image_url"].startswith("data:image/png;base64,") for image in payload["images"]))
             finally:
@@ -451,7 +463,27 @@ class EndToEndTest(unittest.TestCase):
                 sidecar_thread.join(timeout=5)
 
     def test_submit_process_poll_and_fetch_image(self) -> None:
-        image_bytes = b"\x89PNG\r\n\x1a\nimage-payload"
+        self._submit_process_poll_and_fetch_image(b"\x89PNG\r\n\x1a\nimage-payload", "png", "image/png")
+
+    def test_image26_svg_and_gif_outputs(self) -> None:
+        svg = b'<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg" width="64" height="64"><circle cx="32" cy="32" r="20"/></svg>'
+        gif = base64.b64decode("R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==")
+        for output_format, image_bytes, mime in (("svg", svg, "image/svg+xml"), ("gif", gif, "image/gif")):
+            for include_response_format in (False, True):
+                with self.subTest(format=output_format, response_metadata=include_response_format):
+                    self._submit_process_poll_and_fetch_image(
+                        image_bytes, output_format, mime, include_response_format=include_response_format
+                    )
+
+    def test_explicit_image25_model_is_preserved(self) -> None:
+        self._submit_process_poll_and_fetch_image(
+            b"\x89PNG\r\n\x1a\nlegacy-image", "png", "image/png", model="gpt-image-2.5-flare"
+        )
+
+    def _submit_process_poll_and_fetch_image(
+        self, image_bytes: bytes, output_format: str, mime: str,
+        *, include_response_format: bool = False, model: str | None = None,
+    ) -> None:
         encoded = base64.b64encode(image_bytes).decode("ascii")
 
         class FakeUpstreamHandler(BaseHTTPRequestHandler):
@@ -461,9 +493,10 @@ class EndToEndTest(unittest.TestCase):
                 content_length = int(self.headers.get("Content-Length", "0"))
                 body = json.loads(self.rfile.read(content_length))
                 self.__class__.requests.append(body)
-                response = json.dumps(
-                    {"data": [{"b64_json": encoded, "revised_prompt": "revised"}], "usage": {"total_tokens": 3}}
-                ).encode("utf-8")
+                result = {"data": [{"b64_json": encoded, "revised_prompt": "revised"}], "usage": {"total_tokens": 3}}
+                if include_response_format:
+                    result["output_format"] = output_format
+                response = json.dumps(result).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(response)))
@@ -496,9 +529,14 @@ class EndToEndTest(unittest.TestCase):
                 "Content-Type": "application/json",
             }
             try:
+                payload = {"prompt": "test", "quality": "max", "size": "1536x864", "complexity": "low", "output_format": output_format}
+                if model:
+                    payload["model"] = model
+                if output_format == "gif":
+                    payload.update(frame_count=4, frame_duration_ms=200)
                 submit_request = urllib.request.Request(
                     base_url + "/v1/images/generations",
-                    data=json.dumps({"prompt": "test", "quality": "max", "size": "1536x864"}).encode("utf-8"),
+                    data=json.dumps(payload).encode("utf-8"),
                     method="POST",
                     headers=headers,
                 )
@@ -519,13 +557,15 @@ class EndToEndTest(unittest.TestCase):
                         task = json.loads(response.read().decode("utf-8"))
 
                 self.assertEqual(task["status"], "completed")
-                self.assertEqual(task["model"], "gpt-image-2.5-flare")
+                self.assertEqual(task["model"], model or "gpt-image-2.6-flare")
                 self.assertEqual(task["response"]["usage"]["total_tokens"], 3)
-                self.assertEqual(FakeUpstreamHandler.requests[0]["model"], "gpt-image-2.5-flare")
+                self.assertEqual(FakeUpstreamHandler.requests[0], {**payload, "model": model or "gpt-image-2.6-flare"})
                 self.assertEqual(FakeUpstreamHandler.requests[0]["quality"], "max")
                 self.assertEqual(FakeUpstreamHandler.requests[0]["size"], "1536x864")
                 self.assertNotIn("b64_json", json.dumps(task))
+                self.assertTrue(task["outputs"][0]["file"].endswith("." + output_format))
                 with urllib.request.urlopen(base_url + task["outputs"][0]["url"], timeout=5) as response:
+                    self.assertEqual(response.headers.get_content_type(), mime)
                     self.assertEqual(response.read(), image_bytes)
 
                 with store.connect() as conn:
